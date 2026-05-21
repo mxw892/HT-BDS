@@ -1,4 +1,4 @@
-from operator import index
+# HT-BDS: Hub-Temperature-Controlled BDS Testing Software
 from random import randint
 from dataclasses import dataclass
 import time
@@ -42,15 +42,15 @@ class RUN_STATE(IntFlag): # to intflag since it allows for binary combinations o
     RUNNING         = TEMP_CHANGING | PROBE_SWITCHING | LCR_MEASURING # Combination of states that would be considered 'running'
 
 # dataclass for storing the run configuration, which can be easily passed around and modified as needed
-    @dataclass(frozen=True)
-    class RunConfig:
-        device : devices.Device | None
-        start_temp: float
-        step_temp: float
-        max_temp: float
-        dwell_time: float
-        heat_rate: float
-        focus_freq: float
+@dataclass(frozen=True)
+class RunConfig:
+    device : devices.Device | None
+    start_temp: float
+    step_temp: float
+    max_temp: float
+    dwell_time: float
+    heat_rate: float
+    focus_freq: float
 
 # Initialize global constants
 CHAR_OHM    = '\u03A9'
@@ -75,7 +75,7 @@ UNITS: dict[str, float] = {
 }
 
 # column names
-TEMP_STEP_COLUMNS=("Step #", "Time [min]", f"Set Temp. [{CHAR_DEGC}]")
+#TEMP_STEP_COLUMNS=("Step #", "Time [min]", f"Set Temp. [{CHAR_DEGC}]")
 FREQ_STEP_COLUMNS=("Step #", "Frequency [Hz]", "*")
 TEST_DATA_COLUMNS=("Probe #", f"Temp. [{CHAR_DEGC}]","Freq. [Hz]","Cp [F]","Df [1]")
 TEMPERATURE_READINGS_COLUMNS=('Time [s]','Cycle','Mode',f'Set Temp [{CHAR_DEGC}]',f'Chamber Temp [{CHAR_DEGC}]',f'User Temp [{CHAR_DEGC}]')
@@ -95,11 +95,13 @@ class ListVar(tk.StringVar): # pars
         # self.var = tk.StringVar()
         # self.var.trace_add("read", self.get)
     
+    # coverts list to a string
     def set(self, value:list[int|float|str|bool]=[]): # type: ignore
         print(f"Setting {self.name} var... {value}")
         super().set(','.join([str(entry) for entry in value]))
         # self.value = value
     
+    # takes the string, splits it by comma, and converts it back to a list of the correct type
     def get(self) -> list[int|float|str|bool]: # type: ignore
         try:
             # super().get()
@@ -119,37 +121,7 @@ class ListVar(tk.StringVar): # pars
                     return [bool(bool_entry) for bool_entry in raw_list]
         except ValueError:
             return []  # Invalid input
-
-# makes the correct temperature plan based on a stepwise temperature cycle based on user input
-def generate_temperature_plan(start_temp: float, step_temp: float, max_temp: float, dwell_time: float, heat_rate: float):
-    if(step_temp)<=0:
-        raise ValueError("Step temp must be greater than 0.")
-    if(max_temp)<=start_temp:
-        raise ValueError("Max temp must be greater than start temp.")
-    if(dwell_time)<=0:
-        raise ValueError("Dwell time must be greater than 0.")
-    if(heat_rate)<=0:
-        raise ValueError("Heat ramp rate must be greater than 0.")
-    
-    rows = []
-    current_temp = start_temp
-    elapsed = 0
-    step = 1
-    target = start_temp + step_temp
-
-    while target < max_temp:
-        ramp = abs(target - current_temp) / heat_rate
-        elapsed += ramp + dwell_time
-        rows.append([step, target, dwell_time, ramp, elapsed])
-        current_temp = target
-        target += step_temp
-        step += 1
-
-    ramp = abs(max_temp - current_temp) / heat_rate
-    elapsed += ramp + dwell_time
-    rows.append([step, max_temp, dwell_time, ramp, elapsed])
-    return pd.DataFrame(rows, columns = TEMP_PLAN_COLUMNS)
-
+        
 # highlights all text when entry is selected, and formats the text when deselected
 class Entry(tk.Entry):
     textvariable: tk.Variable
@@ -165,7 +137,7 @@ class Entry(tk.Entry):
         
     def format_input(self, *args):
         self.textvariable.set(self.textvariable.get())
-
+# alternating color for table rows, with function to update the whole table based on a given dataframe
 class Table(ttk.Treeview):
     def __init__(self, header_widths, increment=True, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -175,6 +147,7 @@ class Table(ttk.Treeview):
         columns = self.cget('columns')
         self.set_headings(columns, header_widths)
     
+    # sets the column widths and headings based on the given lists
     def set_headings(self, column_list, width_list):
         self.column('#0', width=0, stretch=False)
         self.heading('#0', text="", anchor='w')
@@ -182,11 +155,12 @@ class Table(ttk.Treeview):
             self.column(col, minwidth=width_list[i], width=width_list[i], stretch=False, anchor='w')
             self.heading(col, text=col, anchor='w')
     
+    # updates the whole table based on the given dataframe, with alternating row colors
     def update_table(self, dataframe: pd.DataFrame):
         # Add data with alternating row colors
         # TODO: Fix reiterating whole table for everything ADDED APPEND ROW 
         self.delete(*self.get_children())
-        for i, data in enumerate(dataframe.itertuples(index=True, name=None)):
+        for i, data in enumerate(dataframe.itertuples(index=False, name=None)):
             if self.index_inc:
                 inc_data = [data[0]+1]
                 inc_data.extend(data[1:])
@@ -195,6 +169,7 @@ class Table(ttk.Treeview):
                 self.insert(parent='', index='end', values=data, tags='evenrow')
             else:
                 self.insert(parent='', index='end', values=data, tags='oddrow')
+
     # adds a single row to the end of the table, with alternating row color
     def appendRow(self, data):
         i = len(self.get_children())
@@ -204,6 +179,7 @@ class Table(ttk.Treeview):
         self.insert(parent='', index='end', values=data, tags=tag)
         print("Appending row to table:", data)
 
+# makes the temperature step plot, updates it, and draws it on the canvas when called
 class TempStepPlot:
     master:             tk.Tk
     plot_figure:        Figure
@@ -220,61 +196,48 @@ class TempStepPlot:
         self.temperature_axes = self.plot_figure.subplots(1,1)
         self.times = ListVar('float', "Times")
         self.temperature_data = ListVar('float', "Temperatures")
-        
-    def update_plot(self, dataframe: pd.DataFrame, vals:tuple[float,float]=(0.0,0.0), *args):
-        """ Function (callback viable) which will trigger a redraw of the plots"""
+    
+    # remade to update the plot based on a given dataframe of the temperature plan, with proper formatting and labels
+    def update_plot(self, dataframe: pd.DataFrame, start_temp: float = 25.0, *args):
         print("Updating Temperature Plot...")
-        # steps = dataframe.index.to_list()
         ax = self.temperature_axes
         ax.clear()
-        ax.set_title("Temperature Sequence")
-        ax.set_xlabel("Time [min]")
+        ax.set_title("Temperature Plan Preview")
+        ax.set_xlabel("Elapsed Time [min]")
         ax.set_ylabel(r"$T_{set}$" + f" [{CHAR_DEGC}]")
         ax.grid(which='both')
-        heat_ramp = vals[0]
-        cool_ramp = vals[1]
-        raw_times = list(dataframe[TEMP_STEP_COLUMNS[1]])
-        raw_points = list(dataframe[TEMP_STEP_COLUMNS[2]])
-        ramped_times = [0.0]
-        ramped_points = [25.0] # Room temperature assumption
-        cumulative_delay = 0
-        if len(raw_points) > 0:
-            for i, time in enumerate(raw_times):
-                temp = raw_points[i]
-                last_temp = raw_points[i-1]
-                if temp > last_temp: # Heating step; Add heat delay
-                    cumulative_delay += (temp-last_temp)/heat_ramp
-                elif temp < last_temp: # Cooling step; Add cool delay
-                    cumulative_delay += (last_temp-temp)/cool_ramp
-                else: # Dwell step; Do not add ramp delay
-                    pass
-                ramped_times.append(cumulative_delay) # Introduce a point for reaching the set temp
-                ramped_points.append(raw_points[i]) # Set temp
-                cumulative_delay += time
-                ramped_times.append(cumulative_delay) # Next measurement point is properly delayed
-                ramped_points.append(raw_points[i]) # Measurement point
-            step_points = [ramped_points[0]] # grab first entry
-            step_points.extend(ramped_points) # whole list, with doubled first entry
-            step_times = [ramped_times[0]] # first entry
-            step_times.extend(ramped_times) # whole list, with doubled first entry
-            if len(raw_times) > 2:
-                ramped_times.append(ramped_times[-1]) # repeat last entry
-                ramped_points.append(ramped_points[-1]) # repeat last entry
-            # ax.step(step_times, step_points, linestyle='-')
-            if ramped_times[-1] > 120:
-                ramped_times = [time/60 for time in ramped_times]
-                ax.set_xlabel("Time [hr]")
-            ax.plot(ramped_times, ramped_points, linestyle='-') # Main curve
-            ax.scatter(ramped_times[2:-1:2], ramped_points[2:-1:2], marker='x', s=8**2) # BDS measurement point(s)
-            ax.scatter(ramped_times[0], ramped_points[0], color='red', marker='x', s=8**2, linewidths=2) # Set temp marker(s)
-            ax.scatter(ramped_times[1:-1:2], ramped_points[1:-1:2], marker='|', s=12**2, linewidths=2) # Set temp marker(s)
-        else:
-            ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
-        # print(raw_points)
-        # print(raw_times)
-        self.plot_canvas.draw()
-        # print(ramped_points,'\n', ramped_times)
 
+        if dataframe.empty:
+            ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
+            self.plot_canvas.draw()
+            return
+
+        times = [0.0]
+        temps = [start_temp]
+        current_time=0.0
+        for _, row in dataframe.iterrows():
+            target = float(row[TEMP_PLAN_COLUMNS[1]])
+            dwell_time = float(row[TEMP_PLAN_COLUMNS[2]])
+            ramp_time = float(row[TEMP_PLAN_COLUMNS[3]])
+
+            ramp_end = current_time + ramp_time
+            dwell_end = ramp_end + dwell_time
+
+            times.append(ramp_end)
+            temps.append(target)
+
+            times.append(dwell_end)
+            temps.append(target)
+            current_time = dwell_end
+
+        if times[-1] > 120:
+            times = [t / 60 for t in times]
+            ax.set_xlabel("Elapsed Time [hr]")
+
+        ax.plot(times, temps, marker='o', linestyle='-')
+        self.plot_canvas.draw()
+
+# makes the test data plots, updates them, and draws them on the canvas when called
 class TestDataPlot:
     master:             tk.Tk
     plot_figure:        Figure
@@ -333,7 +296,8 @@ class TestDataPlot:
         print("Updating plots...")
         self.update_capacitance()
         self.update_dissipation()
-        
+    
+    # updates the capacitance plot based on the current frequencies and capacitance data, with proper formatting and labels
     def update_capacitance(self, *args):
         print("Updating Capacitance Plot...")
         points = self.capacitance_data.get()
@@ -350,7 +314,8 @@ class TestDataPlot:
             ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
         ax.legend(["Probe 1", "Probe 2", "Probe 3", "Probe 4"], loc='lower center', bbox_to_anchor=(0.5, 1.05))
         self.plot_canvas.draw()
-            
+    
+    # same as update_capacitance but for dissipation data, with proper formatting and labels
     def update_dissipation(self, *args):
         print("Updating Dissipation Plot...")
         points = self.dissipation_data.get()
@@ -366,26 +331,25 @@ class TestDataPlot:
         else:
             ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
         self.plot_canvas.draw()
-        
+
+# Main application class to hold all the state and functions for the app
 class App():
     app_root:                   tk.Tk
     state:                      RUN_STATE
+    # new variables
+    max_temp_dvar:              tk.DoubleVar # for max temperature in stepwise temp cycle
+    step_temp_dvar:             tk.DoubleVar # for step temperature in stepwise temp cycle
+    dwell_time_dvar:            tk.DoubleVar # for dwell time at each step in stepwise temp cycle
+    heat_rate_dvar:             tk.DoubleVar # for heat ramp rate in stepwise temp cycle
 
-    high_temp_dvar:             tk.DoubleVar
-    high_time_dvar:             tk.DoubleVar
-    low_temp_dvar:              tk.DoubleVar
-    low_time_dvar:              tk.DoubleVar
-    temp_cycles_ivar:           tk.IntVar
-    heat_ramp_dvar:             tk.DoubleVar
-    cool_ramp_dvar:             tk.DoubleVar
-    soak_time_dvar:             tk.DoubleVar
-    set_temp_dvar:              tk.DoubleVar
+    # temperature step variables
     temp_step_locked:           bool
     temp_step_lock_list:        list[tk.Button | Entry]
     temp_step_table:            Table
     temp_step_data:             pd.DataFrame
     temp_step_plot:             TempStepPlot
 
+    # Frequency sweep variables
     first_freq_dvar:            tk.DoubleVar
     last_freq_dvar:             tk.DoubleVar
     custom_freq_dvar:           tk.DoubleVar
@@ -397,6 +361,7 @@ class App():
     custom_freq_table:          Table
     custom_freq_data:           pd.DataFrame
 
+    # test management variables
     active_probes_listvar:      ListVar
     active_lines_listvar:       ListVar
     test_data:                  pd.DataFrame
@@ -418,22 +383,20 @@ class App():
         # Init app vars/entries/etc.
         self.app_root = tk.Tk()
         self.state = RUN_STATE.DONE
-        
-        self.high_temp_dvar = tk.DoubleVar(value=75.0)
-        self.high_time_dvar = tk.DoubleVar(value=60.0)
-        self.low_temp_dvar = tk.DoubleVar(value=-40.0)
-        self.low_time_dvar = tk.DoubleVar(value=60.0)
-        self.heat_ramp_dvar = tk.DoubleVar(value=2.5)
-        self.cool_ramp_dvar = tk.DoubleVar(value=2.5)
-        self.temp_cycles_ivar = tk.IntVar(value=10)
-        self.set_temp_dvar = tk.DoubleVar()
-        self.soak_time_dvar = tk.DoubleVar()
+
+        # new variables
+        self.start_temp = tk.DoubleVar(value=25.0)
+        self.step_temp = tk.DoubleVar(value=20.0)
+        self.max_temp = tk.DoubleVar(value=125.0)
+        self.dwell_time = tk.DoubleVar(value=5.0)
+        self.heat_rate = tk.DoubleVar(value=2.5)
+
         self.first_freq_dvar = tk.DoubleVar(value=devices.LCR_MIN_FREQ)
         self.last_freq_dvar = tk.DoubleVar(value=devices.LCR_MAX_FREQ)
         self.points_per_decade_ivar = tk.IntVar(value=10)
         self.custom_freq_dvar = tk.DoubleVar()
         
-        self.temp_step_data = pd.DataFrame(columns=TEMP_STEP_COLUMNS[1:])
+        self.temp_step_data = pd.DataFrame(columns=TEMP_PLAN_COLUMNS)
         self.custom_freq_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
         self.freq_step_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
         self.test_data = pd.DataFrame(columns=TEST_DATA_COLUMNS)
@@ -460,6 +423,7 @@ class App():
         self.build_app()
         self.app_root.mainloop()
         
+    # switched to a paned window setup
     def build_app(self):
         # Do some setup
         self.app_root.title("Temperature-Controlled BDS Testing")
@@ -468,20 +432,27 @@ class App():
         self.app_root.state('zoomed')
         self.app_root.protocol("WM_DELETE_WINDOW", self.on_closing)
         plt.ioff()
-        self.app_root.option_add('*tearOff', False)
-        # Build the app sections
-        content_frame = tk.Frame(
-            master=self.app_root,
-            background='#e8e8e8',
-            padx=10,
-            pady=10,
-        ); content_frame.pack(side='top', fill='both', expand=True)
-        self.build_menubar(content_frame) 
-        self.build_test_setup(content_frame)
-        self.padding(content_frame, x=10, fill='y', side='left', background='#E8E8E8')
-        self.build_test_management(content_frame)
-        self.padding(content_frame, x=10, fill='y', side='left', background='#E8E8E8')
-        self.build_data_plots(content_frame)
+        self.build_menubar(self.app_root)
+        outer = tk.PanedWindow(
+        self.app_root,
+        orient="horizontal",
+        sashrelief="raised",
+        sashwidth=6,
+        bg="#1E1E2E"
+        )
+        outer.pack(fill="both", expand=True, padx=6, pady=6)
+
+        left = tk.LabelFrame(outer, text="Test Setup", font=('default', 14, 'bold'), padx=10, pady=10)
+        middle = tk.LabelFrame(outer, text="Test Management", font=('default', 14, 'bold'), padx=10, pady=10)
+        right = tk.LabelFrame(outer, text="Data Plots", font=('default', 14, 'bold'), padx=10, pady=10)
+
+        outer.add(left, minsize=300, width=360)
+        outer.add(middle, minsize=340, width=420)
+        outer.add(right, minsize=400, width=900)
+
+        self.build_test_setup(left)
+        self.build_test_management(middle)
+        self.build_data_plots(right)
         return self.app_root
     # END build_app()
 
@@ -491,47 +462,31 @@ class App():
             self.app_root.destroy()
     
     def padding(self, master, x=0, y=0, side='top', fill='both', expand=False, **kwargs):
-        tk.Frame(master=master, width=x, height=y, **kwargs).pack(side=side, fill=fill, expand=expand) # type: ignore
-    
+        tk.Frame(master, width=x, height=y, **kwargs).pack(side=side, fill=fill, expand=expand) # type: ignore
+    # fix for updated vars and removal of old temp cycle inputs
     def sync_temp_step(self, dataframe: pd.DataFrame, *args):
         self.temp_step_table.update_table(dataframe)
-        self.temp_step_plot.update_plot(dataframe, (self.heat_ramp_dvar.get(),self.cool_ramp_dvar.get()))
-
+        self.temp_step_plot.update_plot(dataframe)
+    # menubar with file options
     def build_menubar(self, master):
-        menubar = tk.Menu(master=master, tearoff=False)
+        menubar = tk.Menu(master, tearoff=False)
         fileMenu = tk.Menu(menubar, tearoff=False)
-        fileMenu.add_command(label="Export Results to Excel") #, command=self.exportResults) TODO: Add export function
+        fileMenu.add_command(label="Export Results to Excel") #, command=self.export_results) TODO: Add export function
         fileMenu.add_separator()
         fileMenu.add_command(label="Exit", command=self.on_closing)
         menubar.add_cascade(label="File", menu=fileMenu)
-
-        # TEST_menu = tk.Menu(
-        #     master=menubar,
-        # )
-        # TEST_menu.add_command(label='Badaboom')
-        # menubar.add_cascade(label="TEST", menu=TEST_menu)
-        # menubar.add_separator()
-        # menubar.add_cascade(label="TEST 2")
         self.app_root.config(menu=menubar)
     
     def build_test_setup(self, master):
-        labelframe = tk.LabelFrame(
-            master=master,
-            text="Test Setup",
-            font=('default', 14, 'bold'),
-            padx=10,
-            pady=10,
-            relief='solid',
-            borderwidth=4,
-        ); labelframe.pack(side='left', fill='both')
         notebook_style = ttk.Style()
-        notebook_style.theme_create(themename="NotebookStyle", parent='default', settings={
-            "TNotebook.Tab": {'configure': {'font' : ('default', '12', 'normal')},}})
-        notebook_style.theme_use("NotebookStyle")
+        # notebook_style.theme_create(themename="NotebookStyle", parent='default', settings={
+        #     "TNotebook.Tab": {'configure': {'font' : ('default', '12', 'normal')},}})
+        # notebook_style.theme_use("NotebookStyle")
         notebook = ttk.Notebook(
-            master=labelframe,
+            master,
             style='TNotebook',
         ); notebook.pack(side='top', fill='both', expand=True)
+
         # Temperature Tab
         temperature_tab = tk.Frame(
             master=notebook, 
@@ -567,318 +522,110 @@ class App():
             height=280,
         ); probes_tab.pack(side='top', fill='both', expand=True)
         notebook.add(probes_tab, text="Probes")
-        tk.Label(master=probes_tab, text="Probe Selection", font=('Courier New', 16, 'bold')).pack(pady=(20,10))
-        tk.Label(master=probes_tab, text="Probe selection coming soon!", justify="center", wraplength=380).pack() # TODO: Add probe selection functions
+        tk.Label(master=probes_tab, text="Probe Selection", font=('default', 16, 'bold')).pack(pady=(20,10))
+        tk.Label(master=probes_tab, text="Implementation coming soon!", justify="center", wraplength=380).pack() # TODO: Add probe selection functions
         self.build_probes_tab(probes_tab)
-        
+
+    # moving generate temperature plan into app
+    def generate_temperature_plan(self):
+        try:
+            start_temp = self.start_temp.get()
+            step_temp = self.step_temp.get()
+            max_temp = self.max_temp.get()
+            dwell_time = self.dwell_time.get()
+            heat_rate = self.heat_rate.get()
+
+            rows = []
+
+            current_temp = start_temp
+            elapsed = 0
+            step = 1
+            target = start_temp + step_temp
+
+            while target <= max_temp:
+                ramp_time = abs(target - current_temp) / heat_rate
+                elapsed += ramp_time + dwell_time
+
+                rows.append([
+                    step,
+                    target,
+                    dwell_time,
+                    ramp_time,
+                    elapsed
+                ])
+
+                current_temp = target
+                target += step_temp
+                step += 1
+
+            self.temp_step_data = pd.DataFrame(rows, columns=TEMP_PLAN_COLUMNS)
+
+            self.temp_step_table.update_table(self.temp_step_data)
+            self.temp_step_plot.update_plot(self.temp_step_data)
+
+        except ValueError as e:
+            messagebox.showerror("Invalid Temperature Plan", str(e))
+
+    # helper function to create labeled entries
+    def _labeled_entry(self, parent, label: str, variable: tk.Variable, width=10):
+            row = tk.Frame(parent)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label, width=22, anchor="w").pack(side="left")
+            entry = Entry(row, textvariable=variable, width=width, justify="right")
+            entry.pack(side="left")
+            return entry
+    
+    # remake
     def build_test_temp_tab(self, temperature_tab):
-        self.padding(temperature_tab, y=10, fill='x')
-        # Temperature Cycling inputs
-        temperature_cycling_labelframe = tk.LabelFrame(
-            master=temperature_tab,
-            text="Temperature Cycling",
-            font=('default', 12),
-            padx=10,
-            pady=10,
-        ); temperature_cycling_labelframe.pack(side='top', fill='both')
-        cycling_inputs_frame = tk.Frame(
-            master=temperature_cycling_labelframe,
-            background='red',
-            # padx=10,
-            # pady=10,
-        ); cycling_inputs_frame.pack(side='top', fill='x')
-       
-        high_inputs_row = tk.Frame(
-            master=cycling_inputs_frame,
-        ); high_inputs_row.pack(side='top', fill='x')
-        high_temp_box = tk.Frame(
-            master=high_inputs_row,
-        ); high_temp_box.pack(side='left')
-        high_temp_label = tk.Label(
-            master=high_temp_box,
-            text=f"High Temp. [{CHAR_DEGC}] ",
-        ); high_temp_label.pack(side='left')
-        high_temp_entry = Entry(
-            master=high_temp_box,
-            width=7,
-            justify='right',
-            textvariable=self.high_temp_dvar,
-        ); high_temp_entry.pack(side='left', fill='y')
-        high_time_box = tk.Frame(
-            master=high_inputs_row,
-        ); high_time_box.pack(side='left')
-        high_time_label = tk.Label(
-            master=high_time_box,
-            text=f" for Time [min] ",
-        ); high_time_label.pack(side='left')
-        high_time_entry = Entry(
-            master=high_time_box,
-            width=7,
-            justify='right',
-            textvariable=self.high_time_dvar,
-        ); high_time_entry.pack(side='left', fill='y')
-        heat_ramp_box = tk.Frame(
-            master=high_inputs_row,
-        ); heat_ramp_box.pack(side='left')
-        heat_ramp_label = tk.Label(
-            master=heat_ramp_box,
-            text=f"Heat Ramp [{CHAR_DEGC}/min] ",
-        ); heat_ramp_label.pack(side='left')
-        heat_ramp_entry = Entry(
-            master=heat_ramp_box,
-            width=7,
-            justify='right',
-            textvariable=self.heat_ramp_dvar,
-        ); heat_ramp_entry.pack(side='left', fill='y')
-        
-        self.padding(cycling_inputs_frame, y=10, fill='x')
-        
-        low_inputs_row = tk.Frame(
-            master=cycling_inputs_frame,
-        ); low_inputs_row.pack(side='top', fill='x')
-        low_temp_box = tk.Frame(
-            master=low_inputs_row,
-        ); low_temp_box.pack(side='left')
-        low_temp_label = tk.Label(
-            master=low_temp_box,
-            text=f"Low Temp. [{CHAR_DEGC}] ",
-        ); low_temp_label.pack(side='left')
-        low_temp_entry = Entry(
-            master=low_temp_box,
-            width=7,
-            justify='right',
-            textvariable=self.low_temp_dvar,
-        ); low_temp_entry.pack(side='left', fill='y')
-        low_time_box = tk.Frame(
-            master=low_inputs_row,
-        ); low_time_box.pack(side='left')
-        low_time_label = tk.Label(
-            master=low_time_box,
-            text=f" for Time [min] ",
-        ); low_time_label.pack(side='left')
-        low_time_entry = Entry(
-            master=low_time_box,
-            width=7,
-            justify='right',
-            textvariable=self.low_time_dvar,
-        ); low_time_entry.pack(side='left', fill='y')
-        cool_ramp_box = tk.Frame(
-            master=low_inputs_row,
-        ); cool_ramp_box.pack(side='left')
-        cool_ramp_label = tk.Label(
-            master=cool_ramp_box,
-            text=f"Cool Ramp [{CHAR_DEGC}/min] ",
-        ); cool_ramp_label.pack(side='left')
-        cool_ramp_entry = Entry(
-            master=cool_ramp_box,
-            width=7,
-            justify='right',
-            textvariable=self.cool_ramp_dvar,
-        ); cool_ramp_entry.pack(side='left', fill='y')
-        
-        self.padding(cycling_inputs_frame, y=10, fill='x')
-        
-        num_cycles_input_line = tk.Frame(
-            master=cycling_inputs_frame,
-        ); num_cycles_input_line.pack(side='top', fill='x')
-        cycles_box = tk.Frame(
-            master=num_cycles_input_line,
-        );cycles_box.pack(side='left')
-        cycles_label = tk.Label(
-            master=cycles_box,
-            text=f"Cycles [#] ",
-        ); cycles_label.pack(side='left')
-        cycles_entry = Entry(
-            master=cycles_box,
-            width=7,
-            justify='right',
-            textvariable=self.temp_cycles_ivar,
-        ); cycles_entry.pack(side='left', fill='y')
-        
-        def add_temp_cycle_pressed(*args):
-            high_temp = self.high_temp_dvar.get()
-            high_time = self.high_time_dvar.get()
-            low_temp = self.low_temp_dvar.get()
-            low_time = self.low_time_dvar.get()
-            cycles = self.temp_cycles_ivar.get()
-            if cycles:
-                for x in range(cycles):
-                    tail = len(self.temp_step_data)
-                    self.temp_step_data.loc[tail] = [high_time, high_temp]
-                    self.temp_step_table.appendRow([high_time, high_temp]) # new function
+        params = tk.LabelFrame(temperature_tab, text="Step Parameters", padx=8, pady=8)
+        params.pack(fill="x", pady=6)
 
+        self._labeled_entry(params, f"Start Temp [{CHAR_DEGC}]", self.start_temp)
+        self._labeled_entry(params, f"Step Size [{CHAR_DEGC}]", self.step_temp)
+        self._labeled_entry(params, f"Max Temp [{CHAR_DEGC}]", self.max_temp)
+        self._labeled_entry(params, "Dwell Time [min]", self.dwell_time)
+        self._labeled_entry(params, f"Heat Ramp [{CHAR_DEGC}/min]", self.heat_rate)
 
-                    self.temp_step_data.loc[tail+1] = [low_time, low_temp]
-                    self.temp_step_table.appendRow([low_time, low_temp]) # new function
+        tk.Button(
+            params,
+            text="Generate Plan",
+            command=self.generate_temperature_plan,
+            fg="royalblue"
+        ).pack(pady=(6, 0))
 
-                #self.sync_temp_step(self.temp_step_data)
-                self.temp_step_plot.update_plot(self.temp_step_data, (self.heat_ramp_dvar.get(),self.cool_ramp_dvar.get())) # update plot without reiterating whole table
-            
-        add_cycle_button = tk.Button(
-            master=num_cycles_input_line,
-            text="Add Cycles",
-            command=add_temp_cycle_pressed,
-        ); add_cycle_button.pack(side='left', expand=True) 
-        cycles_entry.bind("<Return>", lambda *args: add_cycle_button.invoke())
-        
-        self.padding(num_cycles_input_line, side='left', expand=True)
-        
-        # Step Measurement inputs
-        
-        self.padding(temperature_tab, y=10, fill='x')
-        measurement_steps_labelframe = tk.LabelFrame(
-            master=temperature_tab,
-            text="Temperature Steps",
-            font=('default', 12),
-            padx=10,
-            pady=10,
-        ); measurement_steps_labelframe.pack(side='top', fill='both')
-        step_inputs_row = tk.Frame(
-            master=measurement_steps_labelframe,
-            # background='red',
-            # padx=10,
-            # pady=10,
-        ); step_inputs_row.pack(side='top', fill='x')
-        
-        set_temp_box = tk.Frame(
-            master=step_inputs_row,
-        ); set_temp_box.pack(side='left')
-        set_temp_label = tk.Label(
-            master=set_temp_box,
-            text=f"Set Temp. [{CHAR_DEGC}] ",
-        ); set_temp_label.pack(side='left')
-        set_temp_entry = Entry(
-            master=set_temp_box,
-            width=7,
-            justify='right',
-            textvariable=self.set_temp_dvar,
-        ); set_temp_entry.pack(side='left', fill='y')
-        soak_time_box = tk.Frame(
-            master=step_inputs_row,
-        ); soak_time_box.pack(side='left')
-        soak_time_label = tk.Label(
-            master=soak_time_box,
-            text=f" for Time [min] ",
-        ); soak_time_label.pack(side='left')
-        soak_time_entry = Entry(
-            master=soak_time_box,
-            width=7,
-            justify='right',
-            textvariable=self.soak_time_dvar,
-        ); soak_time_entry.pack(side='left', fill='y')
-        
-        def add_temp_step_pressed(*args):
-            time = self.soak_time_dvar.get()
-            temp = self.set_temp_dvar.get()
-            df = self.temp_step_data
-            self.temp_step_data.loc[len(df)] = [time, temp]
-            self.sync_temp_step(self.temp_step_data)
-        add_setting_button = tk.Button(
-            master=step_inputs_row,
-            text="Add Step",
-            command=add_temp_step_pressed,
-        ); add_setting_button.pack(side='top', expand=True)
-        set_temp_entry.bind("<Return>", lambda *args: add_setting_button.invoke())
-        soak_time_entry.bind("<Return>", lambda *args: add_setting_button.invoke())
-        
-        
-        # Test Temp settings table
-        self.padding(temperature_tab, y=10, fill='x')
-        measurement_sequence_labelframe = tk.LabelFrame(
-            master=temperature_tab,
-            text="Temperature Sequence",
-            font=('default', 10),
-            padx=10,
-            pady=10,
-        ); measurement_sequence_labelframe.pack(side='top', fill='both', expand=True)
-        setup_table_frame = tk.Frame(
-            master=measurement_sequence_labelframe,
-        ); setup_table_frame.pack(side='top', fill='both')
-        table_with_scroll_frame = tk.Frame(
-            master=setup_table_frame,
-        ); table_with_scroll_frame.pack(side='left', expand=True)
+        table_frame = tk.LabelFrame(temperature_tab, text="Temperature Plan", padx=6, pady=6)
+        table_frame.pack(fill="both", expand=True, pady=4)
+
+        table_with_scroll_frame = tk.Frame(table_frame)
+        table_with_scroll_frame.pack(fill="both", expand=True)
+
         self.temp_step_table = Table(
             master=table_with_scroll_frame,
-            columns=TEMP_STEP_COLUMNS,
+            columns=TEMP_PLAN_COLUMNS,
             displaycolumns='#all',
             show='headings',
             selectmode='none',
-            height=10,
-            header_widths=[40,100,100],
-            increment=True,
-        ); self.temp_step_table.pack(side='left')
+            height=8,
+            header_widths=[60, 130, 130, 130, 140],
+            increment=False,
+        )
+        self.temp_step_table.pack(side='left', fill='both', expand=True)
+
         scrollbar = ttk.Scrollbar(
-            master=table_with_scroll_frame, 
-            orient='vertical', 
+            master=table_with_scroll_frame,
+            orient='vertical',
             command=self.temp_step_table.yview,
-        ); scrollbar.pack(side='left', fill='y')
+        )
+        scrollbar.pack(side='left', fill='y')
         self.temp_step_table.configure(yscrollcommand=scrollbar.set)
 
-        # Test settings button inputs
-        setting_buttons_box = tk.Frame(
-            master=setup_table_frame,
-        ); setting_buttons_box.pack(side='left', fill='both', expand=True)
-        
-        def drop_temp_step_pressed(*args):
-            df = self.temp_step_data
-            if len(df) > 0:
-                self.temp_step_data = df.drop(df.tail(1).index)
-                self.sync_temp_step(self.temp_step_data)
-        
-        remove_setting_button = tk.Button(
-            master=setting_buttons_box,
-            text="Drop Step",
-            command=drop_temp_step_pressed,
-        ); remove_setting_button.pack(side='top', expand=True)
-        # set_temp_entry.bind("<Shift-Return>", lambda *args: remove_setting_button.invoke())
-        
-        def clear_temp_steps_pressed(*args):
-            df = self.temp_step_data
-            if len(df) > 0:
-                self.temp_step_data = df[:0]
-                self.sync_temp_step(self.temp_step_data)
-        
-        clear_setting_button = tk.Button(
-            master=setting_buttons_box,
-            text="Clear List",
-            command=clear_temp_steps_pressed,
-        ); clear_setting_button.pack(side='top', expand=True)
-        
-        def lock_steps_pressed(*args):
-            print("Locking temp step table...")
-            # Toggle the lock
-            self.temp_step_locked = not self.temp_step_locked
-            if self.temp_step_locked: # Lock enabled; Show it's locked
-                for item in self.temp_step_lock_list:
-                    item.config(state='disabled', relief='sunken')
-                print("...Temps Locked")
-            else: # Lock disabled; Show it's unlocked
-                for item in self.temp_step_lock_list:
-                    if isinstance(item, Entry):
-                        item.config(state='normal', relief='sunken')
-                    else: # tk.Button
-                        item.config(state='normal', relief='raised')
-                print("...Temps Unlocked")
-        
-        self.temp_step_locked = False
-        lock_setting_button = tk.Button(
-            master=setting_buttons_box,
-            text="Toggle Lock",
-            command=lock_steps_pressed,
-        ); lock_setting_button.pack(side='top', expand=True)
-        self.temp_step_lock_list = [add_setting_button, remove_setting_button, clear_setting_button, soak_time_entry, set_temp_entry]
-        
-        # Test settings plot
-        self.padding(measurement_sequence_labelframe, y=10, fill='x')
-        plot_frame = tk.Frame(
-            master=measurement_sequence_labelframe,
-            # padx=10,
-            # pady=10,
-        ); plot_frame.pack(side='top', fill='both', expand=True)
+        plot_frame = tk.LabelFrame(temperature_tab, text="Plan Preview", padx=6, pady=6)
+        plot_frame.pack(fill="both", expand=True, pady=4)
+
         self.temp_step_plot = TempStepPlot(plot_frame)
-        self.temp_step_plot.plot_canvas.get_tk_widget().pack(side='top', fill='both', expand=True)
-        self.temp_step_plot.update_plot(self.temp_step_data, (self.heat_ramp_dvar.get(),self.cool_ramp_dvar.get()))
-    
+        self.temp_step_plot.plot_canvas.get_tk_widget().pack(fill='both', expand=True)
+        self.temp_step_plot.update_plot(self.temp_step_data)
+
     def build_test_freq_tab(self, frequency_tab):
         sweep_params_box = tk.LabelFrame(
             master=frequency_tab,
@@ -1253,17 +1000,11 @@ class App():
         return (code, reply)
 
     def build_data_plots(self, master):
-        plots_labelframe = tk.LabelFrame(
-            master=master,
-            text="Data Plots",
-            font=('default', 14, 'bold'),
-            padx=10,
-            pady=10,
-            relief = 'solid',
-            borderwidth=4,
-        ); plots_labelframe.pack(side='left', fill='both', expand=True)
-        test_plot = TestDataPlot(plots_labelframe)
+        
+        test_plot = TestDataPlot(master)
         test_plot.widget.pack(side='top', fill='both', expand=True)
+
+        test_plot.update_plots(self.test_data)
         # master.bind("<Configure>", test_plot.toggle_redraw_delay)
         def on_return(*args):
             print("***RETURN PRESSED***")
@@ -1280,24 +1021,14 @@ class App():
     # END build_data_plots()
 
     def build_test_management(self, master):
-        test_management_labelframe = tk.LabelFrame(
-            master=master,
-            text="Test Management",
-            font=('default', 14, 'bold'),
-            padx=10,
-            pady=10,
-            relief='solid',
-            borderwidth=4,
-        ); test_management_labelframe.pack(side='left', fill='both', expand=True)
-        
-        # Test Control button; e.g. 'Start', 'Pause', 'Stop', etc.
         controls_labelframe = tk.LabelFrame(
-            master=test_management_labelframe,
-            text="Controls",
+            master,
+            text = "Controls",
             font=('default', 12),
             padx=10,
             pady=10,
-        ); controls_labelframe.pack(side='top', anchor='nw')
+        ) 
+        controls_labelframe.pack(side='top', fill='x')
         button_box = tk.Frame(
             master=controls_labelframe,
             padx=10,
@@ -1381,11 +1112,11 @@ class App():
         self.padding(button_box, x=10, side='left', bg='#E8E8E8')
         # stop_button.config(state='disabled', relief='flat')
         
-        self.padding(test_management_labelframe, y=10, side='top')
+        self.padding(master, y=10, side='top')
         
-        """
+        
         table_labelframe = tk.LabelFrame(
-            master=test_management_labelframe,
+            master,
             text="Data Table",
             font=('default', 12),
             padx=10,
@@ -1406,7 +1137,7 @@ class App():
         scrollbar = ttk.Scrollbar(table_with_scroll_frame, orient='vertical', command=data_table.yview)
         data_table.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='left', fill='y')
-        self.padding(test_management_labelframe, y=10, side='top')
+        self.padding(master, y=10, side='top')
         # Configure alternating row colors
         # data_table.tag_configure('evenrow', background='#E8E8E8')
         # data_table.tag_configure('oddrow', background='#FFFFFF')
@@ -1433,10 +1164,10 @@ class App():
                 data_table.insert(parent='', index=i, values=data[i], tags=('evenrow',))
             else:
                 data_table.insert(parent='', index=i, values=data[i], tags=('oddrow',))
-        """
+        
                 
         temp_chart_labelframe = tk.LabelFrame(
-            master=test_management_labelframe,
+            master,
             text="Temperature Chart",
             font=('default', 12),
             padx=10,
