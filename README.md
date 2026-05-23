@@ -10,9 +10,9 @@ built for real lab hardware. not a simulation.
 
 ## what it does
 
-BDS testing means sweeping an LCR meter across a range of frequencies at a series of controlled temperatures, measuring capacitance, dissipation factor, and ESR at each point. you end up with a dataset that tells you how a material's dielectric properties change with both frequency and temperature — useful for characterizing capacitors, polymers, biological samples, anything with interesting electrical behavior across conditions.
+BDS testing means sweeping an LCR meter across a range of frequencies at a series of controlled temperatures, measuring capacitance, dissipation factor, and ESR at each point. you end up with a dataset that tells you how a material's dielectric properties change with both frequency and temperature, useful for characterizing capacitors, polymers, biological samples, anything with interesting electrical behavior across conditions.
 
-doing this manually is tedious and error-prone. signal-chain automates the whole thing: program the oven, wait for it to hit temperature, trigger the LCR sweep, log the data, move to the next step.
+doing this manually is tedious and error prone. signal chain automates the whole thing: program the oven, wait for it to hit temperature, trigger the LCR sweep, log the data, move to the next step.
 
 ---
 
@@ -24,7 +24,7 @@ doing this manually is tedious and error-prone. signal-chain automates the whole
 | Sun Systems EC1A Environmental Chamber | GPIB (VISA) | controls temperature, fires SRQ interrupts at breakpoints |
 | NI USB-6501 DAQ | NI-DAQmx | digital I/O for probe switching (in progress) |
 
-communication goes through PyVISA for the LCR and oven, and NI-DAQmx for the DAQ. the oven uses GPIB service request (SRQ) interrupts to signal when it's reached temperature — the software blocks on `wait_for_srq()` instead of polling, so it's not burning cycles guessing when the oven is ready.
+communication goes through PyVISA for the LCR and oven, and NI-DAQmx for the DAQ. the oven uses GPIB service request (SRQ) interrupts to signal when it's reached temperature, the software blocks on `wait_for_srq()` instead of polling, so it's not burning cycles guessing when the oven is ready.
 
 ---
 
