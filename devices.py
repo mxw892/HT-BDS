@@ -45,7 +45,7 @@ class KeysightLCR_E4980A(Device):
         self.device.read_termination = self.device.write_termination = "\n"
         
     def send(self, cmd:str="", expect:str=""):
-        return DEFAULT_SEND(self.device, cmd, expect)
+        return DEFAULT_SEND(self.device, cmd, expect, read_after_write=True)
 
 # Oven
 class SunSystemsOven_EC1A(Device):
@@ -85,7 +85,49 @@ class NIDAQ_USB6501(Device):
 
 
 DEVICE_TYPE_LIST:list[type[Device]] = [SunSystemsOven_EC1A, KeysightLCR_E4980A, NIDAQ_USB6501]
+
+# rewrote default send to handle errors better
+def DEFAULT_SEND(dev, cmd:str="", expect:str="", read_after_write:bool=False):
+    cmd = cmd.strip()
     
+    # empty
+    if not cmd:
+        return(-1, "No command entered.")
+    
+    try:
+        # if query, send query and return response
+        if cmd.endswith("?"):
+            reply = dev.query(cmd).strip()
+            return (len(cmd), reply)
+        
+        # normal command
+        write_len = dev.write(cmd)
+
+        # does not have ? but response is expected, so read after write
+        if read_after_write:
+            reply = dev.read().strip()
+            return (write_len, reply)
+        
+        return (write_len, "N/A")
+    
+    except pyvisa.errors.VisaIOError as e:
+        return (-1, f"VISA error: {e}")
+
+    except Exception as e:
+        return (-1, f"Error: {type(e).__name__}: {e}")
+
+    # to call default send dependent on type of command (write, query, write_read)
+    def write(self, cmd:str):
+        return DEFAULT_SEND(self.device, cmd)
+
+    def query(self, cmd:str):
+        return DEFAULT_SEND(self.device, cmd)
+
+    def write_read(self, cmd:str):
+        return DEFAULT_SEND(self.device, cmd, read_after_write=True)
+
+
+''' old default send, for reference
 def DEFAULT_SEND(dev:USBInstrument|GPIBInstrument, cmd:str="", expect:str=""):
         is_waiting = True
         w_ret = -1
@@ -131,3 +173,4 @@ def DEFAULT_SEND(dev:USBInstrument|GPIBInstrument, cmd:str="", expect:str=""):
             except Exception as e:
                 raise Exception("ERR:", e)
         return (w_ret, q_ret)
+        '''

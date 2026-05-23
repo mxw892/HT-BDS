@@ -1026,6 +1026,7 @@ class App():
             pady=10,
         ); probes_labelframe.pack(side='top', fill='x')
     
+    # general function for sending commands
     def device_msg(self, query:str="", expected:str="", device:devices.Device|None=None, hushed:bool=False):
         if device == None:
             device = self.active_device
@@ -1170,6 +1171,7 @@ class App():
         # Configure alternating row colors
         # data_table.tag_configure('evenrow', background='#E8E8E8')
         # data_table.tag_configure('oddrow', background='#FFFFFF')
+        # TODO: Add real data here; currently just a placeholder to show table formatting and scrolling
         data = [
             ('a', 'b', 'c'),
             ('A', 'B', 'C'),
