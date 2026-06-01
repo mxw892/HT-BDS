@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import time
 import tkinter as tk
 from tkinter import ttk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 
 # import openpyxl
 from typing import Literal
@@ -33,7 +33,7 @@ except Exception as e:
 
 # OUTPUT FOLDER SETUP
 RUNNING_PATH = os.path.abspath(os.getcwd())
-OUTPUT_FOLDER = "HT-BDS"
+OUTPUT_FOLDER = "HT-BDS Data"
 OUTPUT_FILEPATH = os.path.join(RUNNING_PATH, OUTPUT_FOLDER)
 os.makedirs(OUTPUT_FILEPATH, exist_ok=True)
 DEVICE_NAMES = [dev.name for dev in devices.DEVICE_TYPE_LIST]
@@ -147,13 +147,17 @@ def build_temperature_plan(start_temp, step_temp, max_temp, dwell_time, heat_rat
         raise ValueError("Heat ramp rate must be greater than 0.")
 
     rows = []
-    current_temp = start_temp
     elapsed = 0
     step = 1
-    target = start_temp + step_temp
+    current_temp = start_temp
+    target = start_temp
 
     while target <= max_temp:
-        ramp_time = abs(target - current_temp) / heat_rate
+        if step == 1:
+            ramp_time = 0
+        else:
+            ramp_time = abs(target - current_temp) / heat_rate
+
         elapsed += ramp_time + dwell_time
         rows.append([step, target, dwell_time, ramp_time, elapsed])
 
@@ -190,7 +194,9 @@ class ListVar(tk.StringVar):
         # self.var.trace_add("read", self.get)
 
     # coverts list to a string
-    def set(self, value: list[int | float | str | bool] = []):  # type: ignore
+    def set(self, value=None):  # type: ignore
+        if value is None:
+            value = []
         print(f"Setting {self.name} var... {value}")
         super().set(",".join([str(entry) for entry in value]))
         # self.value = value
@@ -612,7 +618,7 @@ class App:
 
         outer.add(left, minsize=300, width=420)
         outer.add(middle, minsize=340, width=420)
-        outer.add(right, minsize=400, width=700)
+        outer.add(right, minsize=400, width=600)
 
         self.build_test_setup(left)
         self.build_test_management(middle)
@@ -652,6 +658,7 @@ class App:
         self.app_root.config(menu=menubar)
 
     # MAIN GUI PANELS ---------------------------
+    # test setup tab with temperature plan, frequency steps, device communication, and probe selection subtabs
     def build_test_setup(self, master):
         notebook = ttk.Notebook(
             master,
@@ -664,7 +671,6 @@ class App:
             master=notebook,
             width=400,
             height=280,
-            # background='green',
         )
         temperature_tab.pack(side="top", fill="both", expand=True)
         notebook.add(temperature_tab, text="Temperature")
@@ -709,6 +715,7 @@ class App:
         ).pack()  # TODO: Add probe selection functions
         self.build_probes_tab(probes_tab)
 
+    # test management tab with controls, data table, and temperature cycle plot
     def build_test_management(self, master):
         controls_labelframe = tk.LabelFrame(
             master,
@@ -1216,7 +1223,7 @@ class App:
             print("add step")
             freq = self.custom_freq_dvar.get()
             df = self.custom_freq_data
-            if freq in self.freq_step_data[FREQ_STEP_COLUMNS[1]]:
+            if freq in self.freq_step_data[FREQ_STEP_COLUMNS[1]].values:
                 print(f"{freq} Hz exists in sequence!")
                 return
             print([freq, "*"])
@@ -1283,7 +1290,7 @@ class App:
             selectmode="none",
             height=20,
             header_widths=[40, 100],
-            increment=True,
+            increment=False,
         )
         self.custom_freq_table.pack(side="left", fill="both", expand=True)
         custom_table_scrollbar = ttk.Scrollbar(
@@ -1311,7 +1318,7 @@ class App:
             selectmode="none",
             height=20,
             header_widths=[40, 100, 16],
-            increment=True,
+            increment=False,
         )
         self.freq_step_table.pack(side="left", fill="both", expand=True)
         full_table_scrollbar = ttk.Scrollbar(
@@ -1459,11 +1466,17 @@ class App:
         )
 
     # DEVICE BACKEND METHODS -----------------------------
+    # return device type from list
+    def get_device_by_type(self, device_type):
+        for device in self.device_list:
+            if isinstance(device, device_type):
+                return device
+        return None
+
     # general function for sending commands
     def device_msg(
         self,
         query: str = "",
-        expected: str = "",
         device=None,
         hushed=False,
         read_after_write=False,
@@ -1474,16 +1487,17 @@ class App:
                 if not hushed:
                     print(f"Device not set! Cannot send: {query}!")
                 return (-1, np.nan)
+
         command = (
             query if query else self.message_strvar.get()
         )  # use query if provided, otherwise use entry text
 
         code, reply = device.send(
-            cmd=command, expect=expected, read_after_write=read_after_write
+            cmd=command, read_after_write=read_after_write
         )
 
         display_text = f"Length: {str(code)} -->\n{reply}"
-        self.response_strvar.set(display_text)
+        self.app_root.after(0, lambda: self.response_strvar.set(display_text))
 
         if not hushed:
             print(f"Command: '{command}' ({code})\n\tReturn: '{reply}'")
@@ -1499,10 +1513,12 @@ class App:
         print("Programming ...")
         if device is None:
             print("... Programming failed! No device attached!")
+            messagebox.showerror("Error!", "No device connected!")
             self.state = RUN_STATE.IDLE
             return
-        if type(device) is not devices.SunSystemsOven_EC1A:
+        if not isinstance(device, devices.SunSystemsOven_EC1A):
             print("... Programming failed! Active device is not a SunSystemsOven_EC1A!")
+            messagebox.showerror("Error!", "Device is not a compatible oven!")
             self.state = RUN_STATE.IDLE
             return
 
@@ -1515,9 +1531,9 @@ class App:
 
         self.device_msg(device=device, query="ON")
         self.device_msg(device=device, query="STOP")
-        self.device_msg(device=device, query="DELP0")
+        self.device_msg(device=device, query="DELP#0")
 
-        self.device_msg(device=device, query="STORE0")
+        self.device_msg(device=device, query="STORE#0")
 
         self.device_msg(device=device, query="HON")
         self.device_msg(device=device, query="SINT=NNNNNNYNNY0")
@@ -1540,225 +1556,165 @@ class App:
         print("... Programming successful!")
         self.state = RUN_STATE.READY
 
-# LEGACY BACKEND METHODS (to be rewritten) -----------------------------
-    def run(  # TODO: update input vars to RunConfig dataclass and adjust function accordingly
-        self, vars: tuple[devices.Device, float, float, float, float, int, float, float]
-    ):
+    # helper function to parse LCR meter reply and extract relevant measurement values, with error handling for unexpected formats
+    def parse_lcr_reply(self, reply: str):
+        parts = str(reply).strip().split(",")
+        values = []
+        for parts in parts:
+            try:
+                values.append(float(parts.strip()))
+            except ValueError:
+                pass
+
+        if len(values) >= 2:
+            return values[0], values[1]
+
+        return np.nan, np.nan
+
+    # measure lcr at a specific frequency
+    def measure_lcr_at_freq(self, lcr, freq_hz: float):
+        # Cp & Df measurements
+        self.device_msg(device=lcr, query="*CLS", hushed=True)
+        self.device_msg(device=lcr, query=":FUNC:IMP:TYPE CPD", hushed=True)
+        self.device_msg(device=lcr, query=f":FREQ:CW {freq_hz}", hushed=True)
+        self.device_msg(device=lcr, query=":FUNC:IMP:RANG:AUTO ON", hushed=True)
+        self.device_msg(device=lcr, query=":TRIG:SOUR BUS", hushed=True)
+        self.device_msg(device=lcr, query=":INIT:CONT OFF", hushed=True)
+        self.device_msg(device=lcr, query=":INIT", hushed=True)
+        self.device_msg(device=lcr, query="*TRG", hushed=True)
+
+        _, cpd_reply = self.device_msg(device=lcr, query=":FETC:IMP:FORM?", hushed=True)
+        cp, df = self.parse_lcr_reply(cpd_reply)
+
+        # Cs & Rs measurements
+        self.device_msg(device=lcr, query=":FUNC:IMP:TYPE CSRS", hushed=True)
+        self.device_msg(device=lcr, query=f":FREQ:CW {freq_hz}", hushed=True)
+        self.device_msg(device=lcr, query=":INIT", hushed=True)
+        self.device_msg(device=lcr, query="*TRG", hushed=True)
+
+        _, csrs_reply = self.device_msg(
+            device=lcr, query=":FETC:IMP:FORM?", hushed=True
+        )
+        _, esr = self.parse_lcr_reply(csrs_reply)
+
+        return cp, df, esr
+
+    # function to execute the programmed temperature plan and perform measurements at each step, with error handling and timeouts to ensure safe operation
+    def run(self, cfg: RunConfig):
         self.state = RUN_STATE.TEMP_CHANGING
-        device: devices.Device = vars[0]
-        print("Starting Run ...")
-        # print("Device:", device.name)
-        if type(device) is devices.SunSystemsOven_EC1A:
-            high_temp = vars[1]
-            high_time = vars[2]
-            low_temp = vars[3]
-            low_time = vars[4]
-            cycles = vars[5]
-            heat_rate = vars[6]
-            cool_rate = vars[7]
+        # devices
+        oven = cfg.device
+        lcr = self.get_device_by_type(devices.KeysightLCR_E4980A)
 
-            # Calc time to get from low temp to high temp, shortest wait during first heat
-            max_wait = int(
-                (high_temp - low_temp) / min(heat_rate, cool_rate) * 60 + 1
-            )  # duration in seconds; with an extra minute just in case
+        # check devices
+        if lcr is None:
+            print("Run failed: LCR is not connected")
+            messagebox.showerror("Error!", "LCR is not connected!")
+            self.state = RUN_STATE.IDLE
+            return
+        if oven is None:
+            print("Run Failed: No oven connected")
+            messagebox.showerror("Error!", "No oven connected!")
+            self.state = RUN_STATE.IDLE
+            return
+        if not isinstance(oven, devices.SunSystemsOven_EC1A):
+            print("Run Failed: Active device is not a SunSystemsOven_EC1A")
+            self.state = RUN_STATE.IDLE
+            return
+        if self.temp_step_data.empty:
+            self.generate_temperature_plan()
+            if self.temp_step_data.empty:
+                print("Run Failed: Temperature plan is empty")
+                messagebox.showerror("Error!", "No temperature plan!")
+                self.state = RUN_STATE.IDLE
+                return
 
-            write_lock = (
-                threading.Lock()
-            )  # uneccessary now, but will be helpful later when viewing data live
-            stop_read = threading.Event()
-            stop_excel = threading.Event()
-            cycle_duration = (
-                (high_temp - low_temp) / heat_rate
-                + high_time
-                + (high_temp - low_temp) / cool_rate
-                + low_time
-            ) * 60  # seconds of runtime per cycle
-            FIDELITY = 0.1  # 10%
-            READ_INTERVAL = (
-                10  # FIDELITY*cycle_duration # seconds between data reads from the oven
-            )
-            SAVE_INTERVAL = 30  # seconds between saves of table data to excel file
+        start_time = time.time()
 
-            def blank_rolling():
-                return pd.DataFrame(columns=TEMPERATURE_READINGS_COLUMNS)
+        try:
+            self.device_msg(device=oven, query="RUN#0")
 
-            # TODO: Check that old data was removed safely
-            self.temperature_rolling_table = blank_rolling()
+            for _, row in self.temp_step_data.iterrows():
+                step_num = int(row[TEMP_PLAN_COLUMNS[0]])
+                target = float(row[TEMP_PLAN_COLUMNS[1]])
+                dwell = float(row[TEMP_PLAN_COLUMNS[2]])
+                ramp_time = float(row[TEMP_PLAN_COLUMNS[3]])
 
-            def t_oven_read(stop_flag: threading.Event, start: float, details: tuple):
-                while not stop_flag.is_set():
-                    chamber_temp_response = self.device_msg(
-                        device=device, query="CHAM?", hushed=True
-                    )
-                    user_temp_response = self.device_msg(
-                        device=device, query="USER?", hushed=True
-                    )
-                    chamber = chamber_temp_response[1]
-                    user = user_temp_response[1]
-                    current_time = time.time() - start
-                    try:
-                        chamber = float(chamber)
-                        user = float(user)
-                    except Exception as e:
-                        print(f"Error parsing temperature values: {e}")
-                    # debug = randint(0,99)
-                    data = [
-                        current_time,
-                        details[0],
-                        details[1],
-                        details[2],
-                        chamber,
-                        user,
-                    ]
-                    with write_lock:
-                        pos = max(
-                            len(self.temperature_rolling_table), 0
-                        )  # default to 0 if not started yet
-                        self.temperature_rolling_table.loc[pos] = (
-                            data  # append latest data
-                        )
-                    print("Thread @", pos, data)
-                    time.sleep(READ_INTERVAL)
-
-            def t_write_data(stop_flag: threading.Event, filename: str):
-                master_index = 0
-                counter = 0
-                self.temperature_rolling_table.to_excel(
-                    filename, sheet_name="Temperature Data", index=True, header=True
-                )  # Get the basic excel file format down, a.k.a. headers are in there
-                while not stop_flag.is_set():
-                    if counter < SAVE_INTERVAL:
-                        print(f"Excel sleeping {counter+1}/{SAVE_INTERVAL}")
-                        counter += 1
-                        time.sleep(1)
-                        continue
-                    with write_lock:
-                        table = self.temperature_rolling_table
-                        entries_to_write = len(table)
-                        self.temperature_rolling_table = blank_rolling()
-                    if entries_to_write <= 0:  # return to waiting if the table is empty
-                        print("Excel saw no changes to write")
-                    else:
-                        print("EXCEL UPDATE:", master_index, "+", entries_to_write)
-                        table.index += master_index
-                        with pd.ExcelWriter(
-                            path=filename,
-                            engine="openpyxl",
-                            mode="a",
-                            if_sheet_exists="overlay",
-                        ) as writer:
-                            table.to_excel(
-                                writer,
-                                sheet_name="Temperature Data",
-                                index=True,
-                                header=False,
-                                startrow=master_index + 1,
-                                na_rep="nan",
-                            )
-                        self.temperature_readings_table = pd.concat(
-                            [self.temperature_readings_table, table], ignore_index=True
-                        )
-                        master_index += entries_to_write
-                    counter = 0
-                    time.sleep(1)
-                # broke out of the loop, test ended; dump remaining data now
-                with write_lock:
-                    last_table = self.temperature_rolling_table
-                    last_entries_to_write = len(last_table)
-                last_table.index += master_index
-                with pd.ExcelWriter(
-                    path=filename,
-                    engine="openpyxl",
-                    mode="a",
-                    if_sheet_exists="overlay",
-                ) as writer:
-                    last_table.to_excel(
-                        writer,
-                        sheet_name="Temperature Data",
-                        index=True,
-                        header=False,
-                        startrow=master_index + 1,
-                        na_rep="nan",
-                    )
-                self.temperature_readings_table = pd.concat(
-                    [self.temperature_readings_table, last_table], ignore_index=True
-                )
-                master_index += last_entries_to_write
-                self.temperature_rolling_table = blank_rolling()
                 print(
-                    "EXCEL COMPLETE:\n",
-                    master_index,
-                    "to",
-                    master_index + last_entries_to_write,
+                    f"Running Step {step_num}: Target={target}, Dwell={dwell} min, Ramp Time={ramp_time} min"
                 )
 
-            default_filename = (
-                OUTPUT_FILEPATH
-                + f"\\TEST_RUN_{cycles}x{int(high_temp)}-{int(low_temp)}.xlsx"
-            )
-            output_filename = ""
-            while not output_filename:
-                output_filename = filedialog.asksaveasfilename(
-                    initialdir=OUTPUT_FILEPATH,
-                    title="Output File?",
-                    defaultextension=".xlsx",
-                    filetypes=[("Excel Worksheet", "*.xlsx")],
-                )
-                print("Output Filename:", output_filename)
+                self.state = RUN_STATE.TEMP_CHANGING
 
-            excel_thread = threading.Thread(
-                target=t_write_data, args=[stop_excel, output_filename], daemon=True
-            )
-            start_time = time.time()
+                max_wait_seconds = int(
+                    (ramp_time + dwell + 2) * 60
+                )  # add buffer time to ensure step completion before timeout
 
-            self.device_msg(device=device, query="RUN 0")
-            excel_thread.start()
-            for cycle_count in range(1, cycles + 1):
-                print(f"Heat: {cycle_count}")
-                read_thread = threading.Thread(
-                    target=t_oven_read,
-                    args=[stop_read, start_time, [cycle_count, "Heating", high_temp]],
-                    daemon=True,
-                )
-                read_thread.start()
-                device.wait_interrupt(
-                    None
-                )  # for val in range(0,int(10e9)): pass # device.wait_interrupt(max_wait)
-                if self.state == RUN_STATE.PAUSE:
-                    device.wait_interrupt(
-                        None
-                    )  # for val in range(0,int(10e9)): pass # device.wait_interrupt(max_wait)
-                stop_read.set()
-                read_thread.join()
-                stop_read.clear()
-                self.device_msg(device=device, query="BKPNTC")
+                try:
+                    print("Waiting for SRQ...")
+                    oven.wait_interrupt(max_wait_seconds)
+                    print("SRQ received")
+                except Exception as e:
+                    print(f"Breakpoint wait failed or timed out at {step_num}: {e}")
 
-                print(f"Cool: {cycle_count}")
-                read_thread = threading.Thread(
-                    target=t_oven_read,
-                    args=[stop_read, start_time, [cycle_count, "Cooling", low_temp]],
-                    daemon=True,
+                chamber_temp = np.nan
+                user_temp = np.nan
+
+                _, chamber_reply = self.device_msg(
+                    device=oven, query="CHAM?", hushed=True
                 )
-                read_thread.start()
-                device.wait_interrupt(
-                    None
-                )  # for val in range(0,int(10e9)): pass # device.wait_interrupt(max_wait)
-                if self.state == RUN_STATE.PAUSE:
-                    device.wait_interrupt(
-                        None
-                    )  # for val in range(0,int(10e9)): pass # device.wait_interrupt(max_wait)
-                stop_read.set()
-                read_thread.join()
-                stop_read.clear()
-                self.device_msg(device=device, query="BKPNTC")
-                # print("Table:\n", self.temperature_readings_table)
-            stop_excel.set()
-            excel_thread.join()
-            stop_excel.clear()
-            # self.temperature_readings_table.to_excel(OUTPUT_FILEPATH+f"TEST_RUN_{cycles}x{int(high_temp)}-{int(low_temp)}_FULL.xlsx", index=True, header=True)
-        self.state = RUN_STATE.DONE
-        print("... Run Finished!")
-        pass
+                _, user_reply = self.device_msg(device=oven, query="USER?", hushed=True)
+
+                try:
+                    chamber_temp = float(chamber_reply)
+                except ValueError:
+                    print(
+                        f"Failed to parse chamber temperature reply: '{chamber_reply}'"
+                    )
+                try:
+                    user_temp = float(user_reply)
+                except ValueError:
+                    print(f"Failed to parse user temperature reply: '{user_reply}'")
+
+                elapsed_time = time.time() - start_time
+
+                self.temperature_rolling_table.loc[
+                    len(self.temperature_rolling_table)
+                ] = [
+                    elapsed_time,
+                    step_num,
+                    "Step Hold",
+                    target,
+                    chamber_temp,
+                    user_temp,
+                ]
+
+                print(
+                    f"Step {step_num} reached."
+                    f"Chamber={chamber_temp}, User={user_temp}"
+                )
+
+                # LCR measurement code would go here, with results appended to measurement data table and plot updated accordingly
+                self.state = RUN_STATE.LCR_MEASURING
+                cp, df, esr = self.measure_lcr_at_freq(lcr, cfg.focus_freq)
+                self.test_data.loc[len(self.test_data)] = [
+                    1,
+                    chamber_temp,
+                    cfg.focus_freq,
+                    cp,
+                    df,
+                    esr,
+                ]
+
+                self.app_root.after(0, self.sync_measurement_data)
+
+                self.device_msg(device=oven, query="BKPNTC")
+            print("Run complete!")
+            self.state = RUN_STATE.DONE
+
+        except Exception as e:
+            print(f"Run Failed: {e}")
+            self.state = RUN_STATE.IDLE
 
     def stop(self):
         self.state = RUN_STATE.DONE
