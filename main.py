@@ -10,8 +10,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
-
-# import openpyxl
+from tkinter import filedialog
 from typing import Literal
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
@@ -22,6 +21,7 @@ import numpy as np
 import pandas as pd
 from enum import IntFlag, auto
 import threading
+from datetime import datetime
 
 # ===============================================================================
 # DEVICE IMPORTS & OUTPUT SETUP
@@ -29,7 +29,7 @@ import threading
 try:
     import devices
 except Exception as e:
-    print(f"Error importing devices module: {e}")
+    raise ImportError(f"Could not import devices.py: {e}")
 
 # OUTPUT FOLDER SETUP
 RUNNING_PATH = os.path.abspath(os.getcwd())
@@ -88,6 +88,16 @@ TEMP_PLAN_COLUMNS = (
     "Ramp Time [min]",
     "Elapsed Time [min]",
 )
+
+# display constants
+DEFAULT_FOCUS_FREQ_HZ = 1000.0
+MEASUREMENT_DISPLAY_ROWS = 100
+
+# user temperature limits, after oven breakpoint wait until user probe is within 0.5C for 3 consec readings, with polls every 5 secs with a 5 min max wait
+USER_TEMP_TOLERANCE_C = 0.5
+USER_TEMP_STABLE_SAMPLES = 3
+USER_TEMP_POLL_SECONDS = 5
+USER_TEMP_MAX_EXTRA_WAIT_SECONDS = 5 * 60
 
 
 # ================================================================================
@@ -403,7 +413,12 @@ class TestDataPlot:
 
         canvas.draw()
 
-    def update_plots(self, dataframe=None):
+    def update_plots(
+        self,
+        dataframe=None,
+        selected_temp="Latest",
+        selected_freq=DEFAULT_FOCUS_FREQ_HZ,
+    ):
         if dataframe is None or dataframe.empty:
             self._draw_empty()
             return
@@ -422,91 +437,195 @@ class TestDataPlot:
         cp_col = "Cp [F]"
         df_col = "Df [1]"
         esr_col = f"ESR [{CHAR_OHM}]"
+        plot_df = dataframe.copy()
 
+        for col in [freq_col, temp_col, cp_col, df_col, esr_col]:
+            plot_df[col] = pd.to_numeric(
+                plot_df[col], errors="coerce"
+            )  # turn bad vals to NaN
+
+        plot_df = plot_df.dropna(subset=[freq_col, temp_col])  # remove unplottable rows
+
+        if plot_df.empty:
+            self._draw_empty()
+            return
+
+        # frequency tab will show one temperature slice only
+        freq_df, freq_temp_label = self._select_temperature_slice(
+            plot_df,
+            temp_col=temp_col,
+            selected_temp=selected_temp,
+        )
+
+        self._plot_frequency_tab(
+            freq_df,
+            freq_temp_label,
+            freq_col,
+            cp_col,
+            df_col,
+            esr_col,
+        )
+
+        # temperature tab will show one frequency slice only
+        temp_df, temp_freq_label = self._select_frequency_slice(
+            plot_df,
+            freq_col=freq_col,
+            selected_freq=selected_freq,
+        )
+
+        self._plot_temperature_tab(
+            temp_df,
+            temp_freq_label,
+            temp_col,
+            cp_col,
+            df_col,
+            esr_col,
+        )
+
+    def _select_temperature_slice(self, dataframe, temp_col, selected_temp):
+        valid_temps = dataframe[temp_col].dropna()
+
+        if valid_temps.empty:
+            return dataframe.iloc[0:0].copy(), "No temperature"
+
+        if selected_temp in (None, "", "Latest"):
+            target_temp = float(valid_temps.iloc[-1])
+            label = f"latest {target_temp:.2f} {CHAR_DEGC}"
+        else:
+            try:
+                requested = float(str(selected_temp).replace(CHAR_DEGC, "").strip())
+                unique_temps = valid_temps.drop_duplicates().to_numpy(dtype=float)
+                target_temp = float(
+                    unique_temps[np.argmin(np.abs(unique_temps - requested))]
+                )
+                label = f"{target_temp:.2f} {CHAR_DEGC}"
+            except (ValueError, TypeError):
+                target_temp = float(valid_temps.iloc[-1])
+                label = f"latest {target_temp:.2f} {CHAR_DEGC}"
+
+        mask = np.isclose(dataframe[temp_col], target_temp, rtol=0, atol=0.25)
+        sliced = dataframe.loc[mask].sort_values(by="Freq. [Hz]")
+
+        return sliced, label
+
+    def _select_frequency_slice(self, dataframe, freq_col, selected_freq):
+        valid_freqs = dataframe[freq_col].dropna()
+
+        if valid_freqs.empty:
+            return dataframe.iloc[0:0].copy(), "No frequency"
+
+        try:
+            requested = float(selected_freq)
+        except (ValueError, TypeError):
+            requested = DEFAULT_FOCUS_FREQ_HZ
+
+        unique_freqs = valid_freqs.drop_duplicates().to_numpy(dtype=float)
+        target_freq = float(unique_freqs[np.argmin(np.abs(unique_freqs - requested))])
+
+        label = f"{target_freq:.6g} Hz"
+        mask = np.isclose(dataframe[freq_col], target_freq, rtol=1e-9, atol=1e-9)
+        sliced = dataframe.loc[mask].sort_values(by=f"Temp. [{CHAR_DEGC}]")
+
+        return sliced, label
+
+    def _plot_frequency_tab(
+        self, dataframe, temp_label, freq_col, cp_col, df_col, esr_col
+    ):
         freq_axes = self.axes["frequency"]
+
         freq_specs = [
             (
                 freq_axes[0],
-                dataframe[freq_col],
-                dataframe[cp_col],
-                "Capacitance vs Frequency",
-                "Frequency [Hz]",
+                cp_col,
+                f"Capacitance vs Frequency @ {temp_label}",
                 "Cp [F]",
-                "semilogx",
             ),
             (
                 freq_axes[1],
-                dataframe[freq_col],
-                dataframe[df_col],
-                "Dissipation Factor vs Frequency",
-                "Frequency [Hz]",
+                df_col,
+                f"Dissipation Factor vs Frequency @ {temp_label}",
                 "Df [1]",
-                "semilogx",
             ),
             (
                 freq_axes[2],
-                dataframe[freq_col],
-                dataframe[esr_col],
-                "ESR vs Frequency",
-                "Frequency [Hz]",
+                esr_col,
+                f"ESR vs Frequency @ {temp_label}",
                 f"ESR [{CHAR_OHM}]",
-                "semilogx",
             ),
         ]
 
-        for ax, x, y, title, xlabel, ylabel, mode in freq_specs:
+        for ax, y_col, title, ylabel in freq_specs:
             ax.clear()
             ax.set_title(title)
-            ax.set_xlabel(xlabel)
+            ax.set_xlabel("Frequency [Hz]")
             ax.set_ylabel(ylabel)
             ax.grid(which="both")
-            if mode == "semilogx":
-                ax.semilogx(x, y, marker="o", linestyle="-")
+
+            if dataframe.empty:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No Data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
             else:
-                ax.plot(x, y, marker="o", linestyle="-")
+                ax.semilogx(
+                    dataframe[freq_col], dataframe[y_col], marker="o", linestyle="-"
+                )
 
         self.canvases["frequency"].draw()
 
-        # temperature plots
+    def _plot_temperature_tab(
+        self, dataframe, freq_label, temp_col, cp_col, df_col, esr_col
+    ):
         temp_axes = self.axes["temperature"]
+
         temp_specs = [
             (
                 temp_axes[0],
-                dataframe[temp_col],
-                dataframe[cp_col],
-                "Capacitance vs Temperature",
-                f"Temperature [{CHAR_DEGC}]",
+                cp_col,
+                f"Capacitance vs Temperature @ {freq_label}",
                 "Cp [F]",
             ),
             (
                 temp_axes[1],
-                dataframe[temp_col],
-                dataframe[df_col],
-                "Dissipation Factor vs Temperature",
-                f"Temperature [{CHAR_DEGC}]",
+                df_col,
+                f"Dissipation Factor vs Temperature @ {freq_label}",
                 "Df [1]",
             ),
             (
                 temp_axes[2],
-                dataframe[temp_col],
-                dataframe[esr_col],
-                "ESR vs Temperature",
-                f"Temperature [{CHAR_DEGC}]",
+                esr_col,
+                f"ESR vs Temperature @ {freq_label}",
                 f"ESR [{CHAR_OHM}]",
             ),
         ]
 
-        for ax, x, y, title, xlabel, ylabel in temp_specs:
+        for ax, y_col, title, ylabel in temp_specs:
             ax.clear()
             ax.set_title(title)
-            ax.set_xlabel(xlabel)
+            ax.set_xlabel(f"Temperature [{CHAR_DEGC}]")
             ax.set_ylabel(ylabel)
             ax.grid(which="both")
-            ax.plot(x, y, marker="o", linestyle="-")
+
+            if dataframe.empty:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No Data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+            else:
+                ax.plot(
+                    dataframe[temp_col], dataframe[y_col], marker="o", linestyle="-"
+                )
 
         self.canvases["temperature"].draw()
 
-    # if no data or missing columns, draw empty plot
     def _draw_empty(self):
         for tab_key, axes in self.axes.items():
             for ax in axes:
@@ -514,9 +633,9 @@ class TestDataPlot:
                 xlabel = ax.get_xlabel()
                 ylabel = ax.get_ylabel()
                 self._format_empty_axis(ax, title, xlabel, ylabel)
+
             self.canvases[tab_key].draw()
 
-    # helper function to format an axis as empty with a "No Data" message
     def _format_empty_axis(self, ax, title, xlabel, ylabel):
         ax.clear()
         ax.set_title(title)
@@ -538,6 +657,9 @@ class App:
         # Init app vars/entries/etc.
         self.app_root = tk.Tk()
         self.state = RUN_STATE.DONE
+        self.run_thread = None
+        self.pause_requested = False
+        self.stop_requested = False
 
         # new variables
         self.start_temp = tk.DoubleVar(value=25.0)
@@ -550,6 +672,11 @@ class App:
         self.last_freq_dvar = tk.DoubleVar(value=devices.LCR_MAX_FREQ)
         self.points_per_decade_ivar = tk.IntVar(value=10)
         self.custom_freq_dvar = tk.DoubleVar()
+
+        self.selected_plot_temp_strvar = tk.StringVar(value="Latest")
+        self.selected_plot_freq_strvar = tk.StringVar(
+            value=f"{DEFAULT_FOCUS_FREQ_HZ:.6G}"
+        )
 
         self.temp_step_data = pd.DataFrame(columns=TEMP_PLAN_COLUMNS)
         self.custom_freq_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
@@ -650,8 +777,9 @@ class App:
         menubar = tk.Menu(master, tearoff=False)
         fileMenu = tk.Menu(menubar, tearoff=False)
         fileMenu.add_command(
-            label="Export Results to Excel"
-        )  # , command=self.export_results) TODO: Add export function
+            label="Export Results to Excel",
+            command=self.export_results,
+        )
         fileMenu.add_separator()
         fileMenu.add_command(label="Exit", command=self.on_closing)
         menubar.add_cascade(label="File", menu=fileMenu)
@@ -727,123 +855,98 @@ class App:
         controls_labelframe.pack(side="top", fill="x")
         button_box = tk.Frame(
             master=controls_labelframe,
-            padx=10,
-            pady=10,
+            padx=8,
+            pady=8,
             bg="#E8E8E8",
         )
-        button_box.pack(side="top", fill="both")
+        button_box.pack(side="top", fill="x")
 
-        self.padding(button_box, x=10, side="left", bg="#E8E8E8")
+        for col in range(4):
+            button_box.grid_columnconfigure(col, weight=1, uniform="controls")
 
-        program_button = tk.Button(
+        button_width = 9
+        button_padx = 4
+        button_pady = 4
+
+        self.program_button = tk.Button(
             master=button_box,
             text="Program",
-            command=lambda *args: threading.Thread(
-                target=lambda: self.program_device(self.get_run_data()), daemon=True
-            ).start(),
+            command=self.on_program_pressed,
             font=("default", 10, "bold"),
-            foreground="royalblue",
-            width=10,
+            width=button_width,
         )
-        program_button.pack(side="left")
+        self.program_button.grid(
+            row=0, column=0, padx=button_padx, pady=button_pady, sticky="ew"
+        )
 
-        self.padding(button_box, x=20, side="left", bg="#E8E8E8")
-
-        def run_button_pressed():
-            if run_button.config("relief")[-1] == "sunken":  # If button pressed
-                run_button.config(
-                    relief="raised",
-                    bg="SystemButtonFace",
-                    fg="forestgreen",
-                    text="Run",
-                )
-            else:
-                run_button.config(
-                    relief="sunken", bg="forestgreen", fg="white", text="Running"
-                )
-                thread = threading.Thread(
-                    target=lambda: self.run(self.get_run_data()), daemon=True
-                )
-                thread.start()
-                program_button.config(state="disabled", relief="flat")
-                run_button.config(state="disabled", relief="flat")
-                # pause_button.config(state='disabled', relief='flat')
-
-        run_button = tk.Button(
+        self.run_button = tk.Button(
             master=button_box,
             text="Run",
-            command=lambda *args: threading.Thread(
-                target=run_button_pressed, daemon=True
-            ).start(),
+            command=self.on_run_pressed,
             font=("default", 10, "bold"),
-            foreground="forestgreen",
-            width=10,
-            # state='disabled',
-            # relief='flat',
+            width=button_width,
+            state="disabled",
         )
-        run_button.pack(side="left")
+        self.run_button.grid(
+            row=0, column=1, padx=button_padx, pady=button_pady, sticky="ew"
+        )
 
-        self.padding(button_box, x=20, side="left", bg="#E8E8E8")
-
-        def pause_button_pressed():  # TODO: May need to modify functionality... Oven may trigger it's own breakpoint during a pause, if currently holding near it's set temp
-            if pause_button.config("relief")[-1] == "sunken":  # If button pressed
-                pause_button.config(
-                    relief="raised",
-                    bg="SystemButtonFace",
-                    fg="darkviolet",
-                    text="Pause",
-                )
-                self.state = RUN_STATE.TEMP_CHANGING
-                self.device_msg(
-                    device=self.active_device, query="BKPNTC"
-                )  # not threaded; needs to be directly under main thread control for safety
-            else:
-                pause_button.config(
-                    relief="sunken", bg="purple2", fg="white", text="Resume"
-                )
-                self.state = RUN_STATE.PAUSE
-                self.device_msg(
-                    device=self.active_device, query="BKPNT"
-                )  # not threaded; needs to be directly under main thread control for safety
-
-        pause_button = tk.Button(
+        self.pause_button = tk.Button(
             master=button_box,
             text="Pause",
-            command=pause_button_pressed,
+            command=self.on_pause_pressed,
             font=("default", 10, "bold"),
-            foreground="darkviolet",
-            width=10,
-            # state='disabled',
-            # relief='flat',
+            width=button_width,
+            state="disabled",
         )
-        pause_button.pack(side="left")
+        self.pause_button.grid(
+            row=0, column=2, padx=button_padx, pady=button_pady, sticky="ew"
+        )
 
-        self.padding(button_box, x=20, side="left", bg="#E8E8E8")
-
-        def stop_button_pressed():
-            self.state = RUN_STATE.DONE
-            self.device_msg(
-                device=self.active_device, query="STOP"
-            )  # not threaded; needs to be directly under main thread control for safety
-            self.device_msg(
-                device=self.active_device, query="COFF"
-            )  # not threaded; needs to be directly under main thread control for safety
-            self.device_msg(
-                device=self.active_device, query="HOFF"
-            )  # not threaded; needs to be directly under main thread control for safety
-
-        stop_button = tk.Button(
+        self.stop_button = tk.Button(
             master=button_box,
             text="Stop",
-            command=stop_button_pressed,
+            command=self.on_stop_pressed,
             font=("default", 10, "bold"),
-            foreground="crimson",
-            width=10,
+            width=button_width,
+            state="disabled",
         )
-        stop_button.pack(side="left")
+        self.stop_button.grid(
+            row=0, column=3, padx=button_padx, pady=button_pady, sticky="ew"
+        )
 
-        self.padding(button_box, x=10, side="left", bg="#E8E8E8")
-        # stop_button.config(state='disabled', relief='flat')
+        self.new_run_button = tk.Button(
+            master=button_box,
+            text="New Run",
+            command=self.on_new_run_pressed,
+            font=("default", 10, "bold"),
+            width=button_width,
+        )
+        self.new_run_button.grid(
+            row=1, column=0, padx=button_padx, pady=button_pady, sticky="ew"
+        )
+
+        self.clear_data_button = tk.Button(
+            master=button_box,
+            text="Clear Data",
+            command=self.on_clear_data_pressed,
+            font=("default", 10, "bold"),
+            width=button_width,
+        )
+        self.clear_data_button.grid(
+            row=1, column=1, padx=button_padx, pady=button_pady, sticky="ew"
+        )
+
+        self.export_button = tk.Button(
+            master=button_box,
+            text="Export",
+            command=self.export_results,
+            font=("default", 10, "bold"),
+            width=button_width,
+        )
+        self.export_button.grid(
+            row=1, column=2, padx=button_padx, pady=button_pady, sticky="ew"
+        )
 
         self.padding(master, y=10, side="top")
 
@@ -860,10 +963,6 @@ class App:
         )
         table_with_scroll_frame.pack(side="top", fill="y")
         self.padding(master, y=10, side="top")
-        # Configure alternating row colors
-        # data_table.tag_configure('evenrow', background='#E8E8E8')
-        # data_table.tag_configure('oddrow', background='#FFFFFF')
-        # TODO: Add real data here; currently just a placeholder to show table formatting and scrolling
 
         # table data and update function for measurement data table and plot
         self.measurement_data_table = Table(
@@ -901,8 +1000,12 @@ class App:
         temp_cycle_fig.patch.set_facecolor("#F0F0F0")
         self.temp_cycle_axis = temp_cycle_fig.add_subplot()
         axis = self.temp_cycle_axis
-        temp_cycle_canvas = FigureCanvasTkAgg(temp_cycle_fig, temp_chart_labelframe)
-        temp_cycle_canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        self.temp_cycle_canvas = FigureCanvasTkAgg(
+            temp_cycle_fig, temp_chart_labelframe
+        )
+        self.temp_cycle_canvas.get_tk_widget().pack(
+            side="top", fill="both", expand=True
+        )
         MAX_LENGTH = 100
         HEADER_LIST = [TEMPERATURE_READINGS_COLUMNS[x] for x in [0, 3, 4, 5]]
         axis.text(
@@ -982,16 +1085,69 @@ class App:
                     axis.clear()
 
                     apply_cosmetics(axis, domain, times, sets, chambs, users)
-                    temp_cycle_canvas.draw()
+                    self.temp_cycle_canvas.draw()
                     # print(times)
                     # print(temps)
-            temp_cycle_canvas.get_tk_widget().after(1000, t_update_temps)
+            self.temp_cycle_canvas.get_tk_widget().after(1000, t_update_temps)
 
         # update_thread = threading.Thread(target=t_update_temps, args=[], daemon=True)
-        temp_cycle_canvas.get_tk_widget().after(1000, t_update_temps)
+        self.temp_cycle_canvas.get_tk_widget().after(1000, t_update_temps)
 
-    # create the data plots on the right panel, with initial empty data
+    # build plots with specified temp and freq with refresh functionality
+    def build_plot_controls(self, master):
+        filter_frame = tk.LabelFrame(
+            master,
+            text="Plot Filters",
+            font=("default", 10),
+            padx=8,
+            pady=6,
+        )
+        filter_frame.pack(side="top", fill="x", pady=(0, 6))
+
+        tk.Label(filter_frame, text="Frequency plots temperature:").pack(side="left")
+
+        self.plot_temp_combobox = ttk.Combobox(
+            filter_frame,
+            textvariable=self.selected_plot_temp_strvar,
+            values=["Latest"],
+            width=14,
+            state="normal",
+        )
+        self.plot_temp_combobox.pack(side="left", padx=(4, 12))
+        self.plot_temp_combobox.bind(
+            "<<ComboboxSelected>>",
+            lambda *args: self.sync_measurement_data(),
+        )
+
+        tk.Label(filter_frame, text="Temperature plots frequency [Hz]:").pack(
+            side="left"
+        )
+
+        self.plot_freq_combobox = ttk.Combobox(
+            filter_frame,
+            textvariable=self.selected_plot_freq_strvar,
+            values=[f"{DEFAULT_FOCUS_FREQ_HZ:.6g}"],
+            width=12,
+        )
+        self.plot_freq_combobox.pack(side="left", padx=(4, 12))
+        self.plot_freq_combobox.bind(
+            "<<ComboboxSelected>>",
+            lambda *args: self.sync_measurement_data(),
+        )
+        self.plot_freq_combobox.bind(
+            "<Return>",
+            lambda *args: self.sync_measurement_data(),
+        )
+
+        tk.Button(
+            filter_frame,
+            text="Refresh",
+            command=self.sync_measurement_data,
+        ).pack(side="left")
+
     def build_data_plots(self, master):
+        self.build_plot_controls(master)
+
         self.test_plot = TestDataPlot(master)
         self.test_plot.widget.pack(side="top", fill="both", expand=True)
         self.test_plot.update_plots(self.test_data)
@@ -1448,10 +1604,445 @@ class App:
         self.temp_step_table.update_table(dataframe)
         self.temp_step_plot.update_plot(dataframe)
 
-    # function to update measurement data table and plot with new test data
+    # combine into one dataframe for export
+    def get_temperature_log(self):
+        return pd.concat(
+            [self.temperature_readings_table, self.temperature_rolling_table],
+            ignore_index=True,
+        )
+
+    # gets most recent measurement
+    def get_display_measurements(self):
+        return self.test_data.tail(MEASUREMENT_DISPLAY_ROWS).reset_index(drop=True)
+
+    def get_selected_plot_frequency(self):
+        try:
+            return float(self.selected_plot_freq_strvar.get())
+        except (ValueError, TypeError, tk.TclError):
+            return DEFAULT_FOCUS_FREQ_HZ
+
+    def get_selected_plot_temperature(self):
+        try:
+            value = self.selected_plot_temp_strvar.get()
+        except (ValueError, TypeError, tk.TclError):
+            value = "Latest"
+        return value or "Latest"
+
+    # updates the dropdown options
+    def update_plot_filter_options(self):
+        if self.test_data.empty:
+            temp_values = ["Latest"]
+            freq_values = [f"{DEFAULT_FOCUS_FREQ_HZ:.6g}"]
+        else:
+            temp_col = f"Temp. [{CHAR_DEGC}]"
+            freq_col = "Freq. [Hz]"
+
+            temps = (
+                pd.to_numeric(self.test_data[temp_col], errors="coerce")
+                .dropna()
+                .drop_duplicates()
+                .tolist()
+            )
+
+            freqs = (
+                pd.to_numeric(self.test_data[freq_col], errors="coerce")
+                .dropna()
+                .drop_duplicates()
+                .sort_values()
+                .tolist()
+            )
+
+            temp_values = ["Latest"] + [f"{temp:.2f}" for temp in temps]
+            freq_values = [f"{freq:.6g}" for freq in freqs] or [
+                f"{DEFAULT_FOCUS_FREQ_HZ:.6g}"
+            ]
+
+        if hasattr(self, "plot_temp_combobox"):
+            self.plot_temp_combobox.configure(values=temp_values)
+
+            if self.selected_plot_temp_strvar.get() not in temp_values:
+                self.selected_plot_temp_strvar.set("Latest")
+
+        if hasattr(self, "plot_freq_combobox"):
+            self.plot_freq_combobox.configure(values=freq_values)
+
+            if (
+                self.selected_plot_freq_strvar.get() not in freq_values
+                and self.test_data.empty
+            ):
+                self.selected_plot_freq_strvar.set(f"{DEFAULT_FOCUS_FREQ_HZ:.6g}")
+
+    # refreshes plots
     def sync_measurement_data(self):
-        self.measurement_data_table.update_table(self.test_data)
-        self.test_plot.update_plots(self.test_data)
+        self.measurement_data_table.update_table(self.get_display_measurements())
+        self.update_plot_filter_options()
+
+        self.test_plot.update_plots(
+            self.test_data,
+            selected_temp=self.get_selected_plot_temperature(),
+            selected_freq=self.get_selected_plot_frequency(),
+        )
+
+    # clears data func
+    def reset_measurement_data(self):
+        self.test_data = pd.DataFrame(columns=TEST_DATA_COLUMNS)
+        self.temperature_readings_table = pd.DataFrame(
+            columns=TEMPERATURE_READINGS_COLUMNS
+        )
+        self.temperature_rolling_table = pd.DataFrame(
+            columns=TEMPERATURE_READINGS_COLUMNS
+        )
+
+        self.last_temperature_readings_length = 0
+
+        self.sync_measurement_data()
+
+    # reset test setup
+    def reset_test_setup(self):
+        self.temp_step_data = pd.DataFrame(columns=TEMP_PLAN_COLUMNS)
+
+        self.freq_step_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
+        self.custom_freq_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
+
+        self.temp_step_table.update_table(self.temp_step_data)
+
+        self.temp_step_plot.update_plot(
+            self.temp_step_data,
+            start_temp=self.start_temp.get(),
+        )
+
+        self.freq_step_table.update_table(pd.DataFrame(columns=FREQ_STEP_COLUMNS))
+
+        self.custom_freq_table.update_table(self.custom_freq_data)
+
+        # reset temp chart
+
+    def reset_temperature_chart(self):
+        self.temp_cycle_axis.clear()
+        self.temp_cycle_axis.set_title("Oven Readings (100 Samples)")
+        self.temp_cycle_axis.set_xlabel("Time [min]")
+        self.temp_cycle_axis.set_ylabel(f"Sampled Temp [{CHAR_DEGC}]")
+        self.temp_cycle_axis.grid(which="both")
+        self.temp_cycle_axis.text(
+            0.5,
+            0.5,
+            "No Data",
+            ha="center",
+            va="center",
+            transform=self.temp_cycle_axis.transAxes,
+        )
+        self.temp_cycle_canvas.draw()
+
+    # button for reset data, will ask for confirmation
+    def on_clear_data_pressed(self):
+        if (self.state & RUN_STATE.RUNNING) or self.state == RUN_STATE.PAUSE:
+            messagebox.showwarning("Run Active", "Stop the run before clearing data.")
+            return
+
+        if not self.test_data.empty:
+            proceed = messagebox.askyesno(
+                "Clear Data",
+                "Clear displayed and stored measurement data? This does not erase exported Excel files.",
+            )
+
+            if not proceed:
+                return
+
+        self.reset_measurement_data()
+
+    # resets the run, clears old data and returns everything to idle state
+    def on_new_run_pressed(self):
+        if (self.state & RUN_STATE.RUNNING) or self.state == RUN_STATE.PAUSE:
+            messagebox.showwarning(
+                "Run Active", "Stop the current run before starting a new run."
+            )
+            return
+
+        self.pause_requested = False
+        self.stop_requested = False
+        self.state = RUN_STATE.IDLE
+
+        self.reset_test_setup()
+        self.reset_temperature_chart()
+        self.reset_measurement_data()
+        self.set_controls_idle()
+
+    # name error checking
+    def make_excel_name_safe(self, name: str):
+        invalid_chars = ["\\", "/", "*", "[", "]", ":", "?"]
+
+        safe_name = str(name)
+        for char in invalid_chars:
+            safe_name = safe_name.replace(char, "_")
+
+        safe_name = safe_name.strip()
+
+        if not safe_name:
+            safe_name = "Sheet"
+
+        return safe_name[:31]
+
+    # makes the export file name
+    def make_temperature_sheet_name(self, temp_c: float, existing_names: set[str]):
+        base_name = f"T_{temp_c:.2f}C".replace("-", "neg_").replace(".", "_")
+        sheet_name = self.make_excel_name_safe(base_name)
+
+        if sheet_name not in existing_names:
+            existing_names.add(sheet_name)
+            return sheet_name
+
+        counter = 2
+        while True:
+            suffix = f"_{counter}"
+            candidate = self.make_excel_name_safe(
+                sheet_name[: 31 - len(suffix)] + suffix
+            )
+
+            if candidate not in existing_names:
+                existing_names.add(candidate)
+                return candidate
+
+            counter += 1
+
+    # autosize columns to make data easier to read
+    def autosize_excel_columns(self, worksheet, max_width=28):
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells:
+                try:
+                    value_length = len(str(cell.value)) if cell.value is not None else 0
+                    max_length = max(max_length, value_length)
+                except Exception:
+                    pass
+            worksheet.column_dimensions[column_letter].width = min(
+                max_length + 2, max_width
+            )
+
+    # exporting function
+    def export_results(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"HT-BDS_{timestamp}.xlsx"
+
+        filepath = filedialog.asksaveasfilename(
+            title="Export HT-BDS Results",
+            initialdir=OUTPUT_FILEPATH,
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx")],
+        )
+
+        if not filepath:
+            return
+
+        try:
+            freq_col = "Freq. [Hz]"
+            temp_col = f"Temp. [{CHAR_DEGC}]"
+            cp_col = "Cp [F]"
+            df_col = "Df [1]"
+            esr_col = f"ESR [{CHAR_OHM}]"
+
+            freq_plan = pd.DataFrame({"Frequency [Hz]": self.get_frequency_list()})
+            temp_log = self.get_temperature_log()
+            measurements = self.test_data.copy()
+
+            if not measurements.empty:
+                for col in [freq_col, temp_col, cp_col, df_col, esr_col]:
+                    if col in measurements.columns:
+                        measurements[col] = pd.to_numeric(
+                            measurements[col], errors="coerce"
+                        )
+                measurements = measurements.sort_values(
+                    by=[temp_col, freq_col],
+                    ignore_index=True,
+                )
+            # metadata
+            metadata = pd.DataFrame(
+                [
+                    ["Export Time", datetime.now().isoformat(timespec="seconds")],
+                    ["Output Path", filepath],
+                    ["Start Temp [C]", self.start_temp.get()],
+                    ["Step Temp [C]", self.step_temp.get()],
+                    ["Max Temp [C]", self.max_temp.get()],
+                    ["Dwell Time [min]", self.dwell_time.get()],
+                    ["Heat Rate [C/min]", self.heat_rate.get()],
+                    [
+                        "Selected Plot Frequency [Hz]",
+                        self.get_selected_plot_frequency(),
+                    ],
+                    ["Measurement Rows", len(measurements)],
+                    ["Temperature Log Rows", len(temp_log)],
+                    ["Frequency Points Requested", len(freq_plan)],
+                ],
+                columns=["Field", "Value"],
+            )
+
+            if measurements.empty:
+                summary = pd.DataFrame(
+                    [
+                        ["Status", "No measurement rows collected."],
+                        ["Measurement Rows", 0],
+                    ],
+                    columns=["Metric", "Value"],
+                )
+
+                temperature_index = pd.DataFrame(
+                    columns=[
+                        "Measured Temp [C]",
+                        "Sheet",
+                        "Measurement Count",
+                        "Min Frequency [Hz]",
+                        "Max Frequency [Hz]",
+                    ]
+                )
+
+                per_temp_sheets = []
+
+            else:
+                summary = pd.DataFrame(
+                    [
+                        ["Measurement Rows", len(measurements)],
+                        [
+                            "Unique Temperatures",
+                            measurements[temp_col].dropna().nunique(),
+                        ],
+                        [
+                            "Unique Frequencies",
+                            measurements[freq_col].dropna().nunique(),
+                        ],
+                        ["Min Frequency [Hz]", measurements[freq_col].min()],
+                        ["Max Frequency [Hz]", measurements[freq_col].max()],
+                        ["Min Temperature [C]", measurements[temp_col].min()],
+                        ["Max Temperature [C]", measurements[temp_col].max()],
+                        ["Failed Cp Count", measurements[cp_col].isna().sum()],
+                        ["Failed Df Count", measurements[df_col].isna().sum()],
+                        ["Failed ESR Count", measurements[esr_col].isna().sum()],
+                    ],
+                    columns=["Metric", "Value"],
+                )
+
+                per_temp_sheets = []
+                index_rows = []
+                existing_sheet_names = {
+                    "Metadata",
+                    "Summary",
+                    "Temperature Index",
+                    "Temperature Plan",
+                    "Frequency Plan",
+                    "Measurements",
+                    "Temperature Log",
+                }
+
+                # group by temperature
+                measurements["_Export Temp Group [C]"] = measurements[temp_col].round(2)
+
+                for temp_value, temp_df in measurements.groupby(
+                    "_Export Temp Group [C]", dropna=True
+                ):
+                    temp_value = float(temp_value)
+                    sheet_name = self.make_temperature_sheet_name(
+                        temp_value, existing_sheet_names
+                    )
+
+                    temp_export_df = (
+                        temp_df.drop(columns=["_Export Temp Group [C]"])
+                        .sort_values(by=freq_col)
+                        .reset_index(drop=True)
+                    )
+
+                    per_temp_sheets.append((temp_value, sheet_name, temp_export_df))
+
+                    index_rows.append(
+                        {
+                            "Measured Temp [C]": temp_value,
+                            "Sheet": sheet_name,
+                            "Measurement Count": len(temp_export_df),
+                            "Min Frequency [Hz]": temp_export_df[freq_col].min(),
+                            "Max Frequency [Hz]": temp_export_df[freq_col].max(),
+                        }
+                    )
+
+                measurements = measurements.drop(columns=["_Export Temp Group [C]"])
+
+                temperature_index = pd.DataFrame(index_rows).sort_values(
+                    by="Measured Temp [C]",
+                    ignore_index=True,
+                )
+
+            with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+                metadata.to_excel(writer, sheet_name="Metadata", index=False)
+                summary.to_excel(writer, sheet_name="Summary", index=False)
+                temperature_index.to_excel(
+                    writer, sheet_name="Temperature Index", index=False
+                )
+                self.temp_step_data.to_excel(
+                    writer, sheet_name="Temperature Plan", index=False
+                )
+                freq_plan.to_excel(writer, sheet_name="Frequency Plan", index=False)
+                measurements.to_excel(writer, sheet_name="Measurements", index=False)
+                temp_log.to_excel(writer, sheet_name="Temperature Log", index=False)
+
+                # writes each individual temperatures data into its own sheet
+                for _, sheet_name, temp_export_df in per_temp_sheets:
+                    temp_export_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                workbook = writer.book
+
+                # add links to each temp sheet
+                if "Temperature Index" in writer.sheets:
+                    index_ws = writer.sheets["Temperature Index"]
+
+                    for row_num in range(2, len(temperature_index) + 2):
+                        sheet_name = index_ws.cell(row=row_num, column=2).value
+
+                        if sheet_name:
+                            cell = index_ws.cell(row=row_num, column=2)
+                            cell.hyperlink = f"#'{sheet_name}'!A1"
+                            cell.style = "Hyperlink"
+
+                    index_ws.freeze_panes = "A2"
+                    index_ws.auto_filter.ref = index_ws.dimensions
+
+                # Add a return link on each temperature sheet.
+                for _, sheet_name, _ in per_temp_sheets:
+                    if sheet_name in writer.sheets:
+                        ws = writer.sheets[sheet_name]
+                        ws.freeze_panes = "A2"
+                        ws.auto_filter.ref = ws.dimensions
+
+                        ws["H1"] = "Back to Temperature Index"
+                        ws["H1"].hyperlink = "#'Temperature Index'!A1"
+                        ws["H1"].style = "Hyperlink"
+
+                # keep headers visible
+                for sheet_name in [
+                    "Metadata",
+                    "Summary",
+                    "Temperature Index",
+                    "Temperature Plan",
+                    "Frequency Plan",
+                    "Measurements",
+                    "Temperature Log",
+                ]:
+                    if sheet_name in writer.sheets:
+                        ws = writer.sheets[sheet_name]
+
+                        if ws.max_row > 1:
+                            ws.freeze_panes = "A2"
+                            ws.auto_filter.ref = ws.dimensions  # filter
+
+                # Autosize columns across all sheets.
+                for ws in workbook.worksheets:
+                    self.autosize_excel_columns(ws)
+
+            messagebox.showinfo("Export Complete", f"Results exported to:\n{filepath}")
+
+        except Exception as e:
+            messagebox.showerror(
+                "Export Failed",
+                f"Could not export results:\n{type(e).__name__}: {e}",
+            )
 
     # helper function to get run data from user inputs and return as RunConfig dataclass
     def get_run_data(self, *args):
@@ -1462,8 +2053,32 @@ class App:
             max_temp=self.max_temp.get(),
             dwell_time=self.dwell_time.get(),
             heat_rate=self.heat_rate.get(),
-            focus_freq=1000.0,
+            focus_freq=DEFAULT_FOCUS_FREQ_HZ,
         )
+
+    # get the full frequency list from the tables
+    def get_frequency_list(self):
+        combined = pd.concat(
+            [self.freq_step_data, self.custom_freq_data],
+            ignore_index=True,
+        )
+
+        if combined.empty or FREQ_STEP_COLUMNS[1] not in combined.columns:
+            return [self.get_run_data().focus_freq]
+
+        freqs = (
+            combined[FREQ_STEP_COLUMNS[1]]
+            .dropna()
+            .astype(float)
+            .drop_duplicates()
+            .sort_values()
+            .tolist()
+        )
+
+        if not freqs:
+            return [self.get_run_data().focus_freq]
+
+        return freqs
 
     # DEVICE BACKEND METHODS -----------------------------
     # return device type from list
@@ -1472,6 +2087,31 @@ class App:
             if isinstance(device, device_type):
                 return device
         return None
+
+    def log_oven_temperature(self, oven, start_time, step_num, target, mode="Running"):
+        _, chamber_reply = self.device_msg(device=oven, query="CHAM?", hushed=True)
+        _, user_reply = self.device_msg(device=oven, query="USER?", hushed=True)
+
+        try:
+            chamber_temp = float(chamber_reply)
+        except (ValueError, TypeError):
+            chamber_temp = np.nan
+
+        try:
+            user_temp = float(user_reply)
+        except (ValueError, TypeError):
+            user_temp = np.nan
+
+        elapsed_time = time.time() - start_time
+        self.temperature_rolling_table.loc[len(self.temperature_rolling_table)] = [
+            elapsed_time,
+            step_num,
+            mode,
+            target,
+            chamber_temp,
+            user_temp,
+        ]
+        return chamber_temp, user_temp
 
     # general function for sending commands
     def device_msg(
@@ -1492,9 +2132,7 @@ class App:
             query if query else self.message_strvar.get()
         )  # use query if provided, otherwise use entry text
 
-        code, reply = device.send(
-            cmd=command, read_after_write=read_after_write
-        )
+        code, reply = device.send(cmd=command, read_after_write=read_after_write)
 
         display_text = f"Length: {str(code)} -->\n{reply}"
         self.app_root.after(0, lambda: self.response_strvar.set(display_text))
@@ -1508,15 +2146,15 @@ class App:
     def program_device(self, cfg: RunConfig):
         self.generate_temperature_plan()
         self.state = RUN_STATE.PROGRAMMING
-        device = cfg.device
+        oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
 
         print("Programming ...")
-        if device is None:
+        if oven is None:
             print("... Programming failed! No device attached!")
             messagebox.showerror("Error!", "No device connected!")
             self.state = RUN_STATE.IDLE
             return
-        if not isinstance(device, devices.SunSystemsOven_EC1A):
+        if not oven:
             print("... Programming failed! Active device is not a SunSystemsOven_EC1A!")
             messagebox.showerror("Error!", "Device is not a compatible oven!")
             self.state = RUN_STATE.IDLE
@@ -1529,40 +2167,93 @@ class App:
             self.state = RUN_STATE.IDLE
             return
 
-        self.device_msg(device=device, query="ON")
-        self.device_msg(device=device, query="STOP")
-        self.device_msg(device=device, query="DELP#0")
+        self.device_msg(device=oven, query="ON")
+        self.device_msg(device=oven, query="STOP")
+        self.device_msg(device=oven, query="DELP#0")
 
-        self.device_msg(device=device, query="STORE#0")
+        self.device_msg(device=oven, query="STORE#0")
 
-        self.device_msg(device=device, query="HON")
-        self.device_msg(device=device, query="SINT=NNNNNNYNNY0")
+        self.device_msg(device=oven, query="HON")
+        self.device_msg(device=oven, query="SINT=NNNNNNYNNY0")
 
         for _, row in self.temp_step_data.iterrows():
             step_num = int(row[TEMP_PLAN_COLUMNS[0]])
             target = float(row[TEMP_PLAN_COLUMNS[1]])
             dwell = float(row[TEMP_PLAN_COLUMNS[2]])
 
-            self.device_msg(device=device, query=f"RATE={cfg.heat_rate:.2f}")
-            self.device_msg(device=device, query=f"WAIT={minutes_to_wait(dwell)}")
-            self.device_msg(device=device, query=f"SET={target:.1f}")
+            self.device_msg(device=oven, query=f"RATE={cfg.heat_rate:.2f}")
+            self.device_msg(device=oven, query=f"WAIT={minutes_to_wait(dwell)}")
+            self.device_msg(device=oven, query=f"SET={target:.1f}")
 
-            self.device_msg(device=device, query=f"BKPNT {step_num}")
+            self.device_msg(device=oven, query=f"BKPNT {step_num}")
 
-        self.device_msg(device=device, query="HOFF")
-        self.device_msg(device=device, query="COFF")
-        self.device_msg(device=device, query="END")
+        self.device_msg(device=oven, query="HOFF")
+        self.device_msg(device=oven, query="COFF")
+        self.device_msg(device=oven, query="END")
 
         print("... Programming successful!")
         self.state = RUN_STATE.READY
+
+    def wait_for_user_temp_stable(
+        self,
+        oven,
+        start_time,
+        step_num,
+        target,
+        tolerance=USER_TEMP_TOLERANCE_C,
+        stable_samples_required=USER_TEMP_STABLE_SAMPLES,
+        poll_seconds=USER_TEMP_POLL_SECONDS,
+        max_extra_wait_seconds=USER_TEMP_MAX_EXTRA_WAIT_SECONDS,
+    ):
+        print(
+            f"Step {step_num}: waiting for USER probe to reach "
+            f"{target:.2f} {CHAR_DEGC} ± {tolerance:.2f} {CHAR_DEGC}"
+        )
+
+        stable_count = 0
+        wait_start = time.time()
+        last_chamber_temp = np.nan
+        last_user_temp = np.nan
+
+        while not self.stop_requested:
+            chamber_temp, user_temp = self.log_oven_temperature(
+                oven, start_time, step_num, target, mode="User temp stabilizing"
+            )
+
+            last_chamber_temp = chamber_temp
+            last_user_temp = user_temp
+
+            if not np.isnan(user_temp) and abs(user_temp - target) <= tolerance:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            if stable_count >= stable_samples_required:
+                print(
+                    f"Step {step_num} user probe stabilized at"
+                    f"{user_temp:.2f} {CHAR_DEGC}"
+                )
+                return chamber_temp, user_temp, True
+            if time.time() - wait_start > max_extra_wait_seconds:
+                print(
+                    f"Step {step_num}: user probe did not stabilize within {max_extra_wait_seconds} seconds. Continuing with last reading"
+                )
+                return last_chamber_temp, last_user_temp, False
+
+            for _ in range(int(poll_seconds * 2)):
+                if self.stop_requested:
+                    break
+                time.sleep(0.5)
+
+        return last_chamber_temp, last_user_temp, False
 
     # helper function to parse LCR meter reply and extract relevant measurement values, with error handling for unexpected formats
     def parse_lcr_reply(self, reply: str):
         parts = str(reply).strip().split(",")
         values = []
-        for parts in parts:
+        for part in parts:
             try:
-                values.append(float(parts.strip()))
+                values.append(float(part.strip()))
             except ValueError:
                 pass
 
@@ -1599,14 +2290,104 @@ class App:
 
         return cp, df, esr
 
+    # state controls
+    def set_controls_idle(self):
+        self.program_button.config(state="normal")
+        self.run_button.config(state="disabled", text="Run")
+        self.pause_button.config(state="disabled", text="Pause")
+        self.stop_button.config(state="disabled")
+
+        if hasattr(self, "new_run_button"):
+            self.new_run_button.config(state="normal")
+            self.clear_data_button.config(state="normal")
+            self.export_button.config(state="normal")
+
+    def set_controls_programmed(self):
+        self.program_button.config(state="normal")
+        self.run_button.config(state="normal", text="Run")
+        self.pause_button.config(state="disabled", text="Pause")
+        self.stop_button.config(state="normal")
+
+        if hasattr(self, "new_run_button"):
+            self.new_run_button.config(state="normal")
+            self.clear_data_button.config(state="normal")
+            self.export_button.config(state="normal")
+
+    def set_controls_running(self):
+        self.program_button.config(state="disabled")
+        self.run_button.config(state="disabled", text="Running")
+        self.pause_button.config(state="normal", text="Pause")
+        self.stop_button.config(state="normal")
+
+        if hasattr(self, "new_run_button"):
+            self.new_run_button.config(state="disabled")
+            self.clear_data_button.config(state="disabled")
+            self.export_button.config(state="disabled")
+
+    def on_program_pressed(self):
+        def worker():
+            self.program_device(self.get_run_data())
+            if self.state == RUN_STATE.READY:
+                self.app_root.after(0, self.set_controls_programmed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_run_pressed(self):
+        self.pause_requested = False
+        self.stop_requested = False
+        self.set_controls_running()
+
+        self.run_thread = threading.Thread(
+            target=lambda: self.run(self.get_run_data()),
+            daemon=True,
+        )
+        self.run_thread.start()
+
+    def on_pause_pressed(self):
+        oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
+
+        if oven is None:
+            print("Pause failed: oven not connected")
+            return
+
+        if not self.pause_requested:
+            self.pause_requested = True
+            self.state = RUN_STATE.PAUSE
+            self.pause_button.config(text="Resume")
+            self.device_msg(device=oven, query="BKPNT")
+        else:
+            self.pause_requested = False
+            self.state = RUN_STATE.TEMP_CHANGING
+            self.pause_button.config(text="Pause")
+            self.device_msg(device=oven, query="BKPNTC")
+
+    def on_stop_pressed(self):
+        self.stop_requested = True
+        self.pause_requested = False
+        self.state = RUN_STATE.DONE
+
+        oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
+
+        if oven is not None:
+            self.device_msg(device=oven, query="STOP")
+            self.device_msg(device=oven, query="COFF")
+            self.device_msg(device=oven, query="HOFF")
+
+        self.set_controls_idle()
+
     # function to execute the programmed temperature plan and perform measurements at each step, with error handling and timeouts to ensure safe operation
     def run(self, cfg: RunConfig):
         self.state = RUN_STATE.TEMP_CHANGING
         # devices
-        oven = cfg.device
+        oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
         lcr = self.get_device_by_type(devices.KeysightLCR_E4980A)
 
         # check devices
+        if all(device is None for device in self.device_list):
+            print("Run failed: No devices connected")
+            messagebox.showerror("Error!", "No devices are connected!")
+            self.state = RUN_STATE.IDLE
+            return
         if lcr is None:
             print("Run failed: LCR is not connected")
             messagebox.showerror("Error!", "LCR is not connected!")
@@ -1635,6 +2416,11 @@ class App:
             self.device_msg(device=oven, query="RUN#0")
 
             for _, row in self.temp_step_data.iterrows():
+
+                if self.stop_requested:
+                    print("Run stopped by user.")
+                    break
+
                 step_num = int(row[TEMP_PLAN_COLUMNS[0]])
                 target = float(row[TEMP_PLAN_COLUMNS[1]])
                 dwell = float(row[TEMP_PLAN_COLUMNS[2]])
@@ -1650,31 +2436,55 @@ class App:
                     (ramp_time + dwell + 2) * 60
                 )  # add buffer time to ensure step completion before timeout
 
-                try:
-                    print("Waiting for SRQ...")
-                    oven.wait_interrupt(max_wait_seconds)
-                    print("SRQ received")
-                except Exception as e:
-                    print(f"Breakpoint wait failed or timed out at {step_num}: {e}")
+                wait_done = threading.Event()
 
-                chamber_temp = np.nan
-                user_temp = np.nan
+                def wait_for_breakpoint():
+                    try:
+                        print("Waiting for SRQ...")
+                        oven.wait_interrupt(max_wait_seconds)
+                        print("SRQ received")
+                    except Exception as e:
+                        print(f"Breakpoint wait failed or timed out at {step_num}: {e}")
+                    finally:
+                        wait_done.set()
 
-                _, chamber_reply = self.device_msg(
-                    device=oven, query="CHAM?", hushed=True
-                )
-                _, user_reply = self.device_msg(device=oven, query="USER?", hushed=True)
+                wait_thread = threading.Thread(target=wait_for_breakpoint, daemon=True)
+                wait_thread.start()
 
-                try:
-                    chamber_temp = float(chamber_reply)
-                except ValueError:
-                    print(
-                        f"Failed to parse chamber temperature reply: '{chamber_reply}'"
+                while not wait_done.is_set():
+                    if self.stop_requested:
+                        print("Stop requested while waiting.")
+                        break
+                    while self.pause_requested and not self.stop_requested:
+                        time.sleep(0.5)
+                    chamber_temp, user_temp = self.log_oven_temperature(
+                        oven, start_time, step_num, target, mode="Temp Changing"
                     )
-                try:
-                    user_temp = float(user_reply)
-                except ValueError:
-                    print(f"Failed to parse user temperature reply: '{user_reply}'")
+
+                    for _ in range(10):
+                        if self.stop_requested:
+                            break
+                        time.sleep(0.5)
+
+                if self.stop_requested:
+                    print("Stop requested before user temperature stabilization can be reached.")
+                    self.state = RUN_STATE.DONE
+                    self.app_root.after(0, self.set_controls_idle)
+                    return
+
+                self.state = RUN_STATE.TEMP_CHANGING
+                chamber_temp, user_temp, user_stable = self.wait_for_user_temp_stable(
+                    oven,
+                    start_time,
+                    step_num,
+                    target,
+                )
+
+                if self.stop_requested:
+                    print("Stop requested before user temperature stabilization can be reached.")
+                    self.state = RUN_STATE.DONE
+                    self.app_root.after(0, self.set_controls_idle)
+                    return
 
                 elapsed_time = time.time() - start_time
 
@@ -1683,38 +2493,57 @@ class App:
                 ] = [
                     elapsed_time,
                     step_num,
-                    "Step Hold",
+                    "Measurement Start",
                     target,
                     chamber_temp,
                     user_temp,
                 ]
 
                 print(
-                    f"Step {step_num} reached."
-                    f"Chamber={chamber_temp}, User={user_temp}"
+                    f"Step {step_num} ready for measurememt. "
+                    f"Target {target}, Chamber={chamber_temp}, User={user_temp}, "
+                    f"User Stable = {user_stable}"
                 )
 
-                # LCR measurement code would go here, with results appended to measurement data table and plot updated accordingly
                 self.state = RUN_STATE.LCR_MEASURING
-                cp, df, esr = self.measure_lcr_at_freq(lcr, cfg.focus_freq)
-                self.test_data.loc[len(self.test_data)] = [
-                    1,
-                    chamber_temp,
-                    cfg.focus_freq,
-                    cp,
-                    df,
-                    esr,
-                ]
+                freqs = self.get_frequency_list()
+                if self.stop_requested:
+                    break
+                for freq in freqs:
+                    if self.stop_requested:
+                        print("Stop requested during LCR sweep.")
+                        break
+                    while self.pause_requested and not self.stop_requested:
+                        time.sleep(0.5)
+                    if self.stop_requested:
+                        print("Stop requested before LCR measurement.")
+                    cp, df, esr = self.measure_lcr_at_freq(lcr, freq)
+                    self.test_data.loc[len(self.test_data)] = [
+                        1,
+                        user_temp,
+                        freq,
+                        cp,
+                        df,
+                        esr,
+                    ]
 
                 self.app_root.after(0, self.sync_measurement_data)
+
+                if self.stop_requested:
+                    print("Run stopped during LCR sweep. Not continuing oven program.")
+                    self.state = RUN_STATE.DONE
+                    self.app_root.after(0, self.set_controls_idle)
+                    return
 
                 self.device_msg(device=oven, query="BKPNTC")
             print("Run complete!")
             self.state = RUN_STATE.DONE
+            self.app_root.after(0, self.set_controls_idle)
 
         except Exception as e:
             print(f"Run Failed: {e}")
             self.state = RUN_STATE.IDLE
+            self.app_root.after(0, self.set_controls_idle)
 
     def stop(self):
         self.state = RUN_STATE.DONE
