@@ -27,7 +27,7 @@ from datetime import datetime
 # DEVICE IMPORTS & OUTPUT SETUP
 # ===============================================================================
 try:
-    import devices
+    import devices as devices
 except Exception as e:
     raise ImportError(f"Could not import devices.py: {e}")
 
@@ -91,13 +91,28 @@ TEMP_PLAN_COLUMNS = (
 
 # display constants
 DEFAULT_FOCUS_FREQ_HZ = 1000.0
-MEASUREMENT_DISPLAY_ROWS = 100
+MEASUREMENT_DISPLAY_ROWS = 50
+
+# conservative software safety limits
+SAFETY_MIN_TEMP_C = -70.0
+SAFETY_MAX_TEMP_C = 180.0
+SAFETY_MAX_STEP_C = 50.0
+SAFETY_MAX_DWELL_MIN = 24 * 60.0
+SAFETY_MAX_RAMP_C_PER_MIN = 10.0
+SAFETY_MAX_TOTAL_HOURS = 72.0
+SAFETY_CONFIRM_TEMP_C = 100.0
+OVEN_WAIT_CHUNK_SECONDS = 5
+OVEN_BREAKPOINT_TIMEOUT_BUFFER_MINUTES = 10
+TEMPERATURE_ROLLING_MAX_ROWS = 500
 
 # user temperature limits, after oven breakpoint wait until user probe is within 0.5C for 3 consec readings, with polls every 5 secs with a 5 min max wait
-USER_TEMP_TOLERANCE_C = 0.5
-USER_TEMP_STABLE_SAMPLES = 3
+USER_TEMP_TOLERANCE_C = 1.5
+USER_TEMP_STABLE_SAMPLES = 2
 USER_TEMP_POLL_SECONDS = 5
-USER_TEMP_MAX_EXTRA_WAIT_SECONDS = 5 * 60
+USER_TEMP_MAX_EXTRA_WAIT_SECONDS = 90
+
+# keysight lcr overrange threshold, it returns this for invalid/out of range measurements
+KEYSIGHT_OVERRANGE_THRESHOLD = 9.8e37
 
 
 # ================================================================================
@@ -149,24 +164,37 @@ class RunConfig:
 def build_temperature_plan(start_temp, step_temp, max_temp, dwell_time, heat_rate):
     if step_temp <= 0:
         raise ValueError("Step temp must be greater than 0.")
+    if step_temp > SAFETY_MAX_STEP_C:
+        raise ValueError(
+            f"Step temp must be {SAFETY_MAX_STEP_C:g} {CHAR_DEGC} or less."
+        )
     if max_temp <= start_temp:
         raise ValueError("Max temp must be greater than start temp.")
+    if start_temp < SAFETY_MIN_TEMP_C or max_temp > SAFETY_MAX_TEMP_C:
+        raise ValueError(
+            f"Temperatures must stay between {SAFETY_MIN_TEMP_C:g} and {SAFETY_MAX_TEMP_C:g} {CHAR_DEGC}."
+        )
     if dwell_time <= 0:
         raise ValueError("Dwell time must be greater than 0.")
+    if dwell_time > SAFETY_MAX_DWELL_MIN:
+        raise ValueError(
+            f"Dwell time must be {SAFETY_MAX_DWELL_MIN:g} minutes or less."
+        )
     if heat_rate <= 0:
         raise ValueError("Heat ramp rate must be greater than 0.")
+    if heat_rate > SAFETY_MAX_RAMP_C_PER_MIN:
+        raise ValueError(
+            f"Heat ramp rate must be {SAFETY_MAX_RAMP_C_PER_MIN:g} {CHAR_DEGC}/min or less."
+        )
 
     rows = []
-    elapsed = 0
+    elapsed = 0.0
     step = 1
     current_temp = start_temp
     target = start_temp
 
-    while target <= max_temp:
-        if step == 1:
-            ramp_time = 0
-        else:
-            ramp_time = abs(target - current_temp) / heat_rate
+    while target < max_temp:
+        ramp_time = abs(target - current_temp) / heat_rate
 
         elapsed += ramp_time + dwell_time
         rows.append([step, target, dwell_time, ramp_time, elapsed])
@@ -174,6 +202,14 @@ def build_temperature_plan(start_temp, step_temp, max_temp, dwell_time, heat_rat
         current_temp = target
         target += step_temp
         step += 1
+
+    if not np.isclose(current_temp, max_temp):
+        ramp_time = abs(max_temp - current_temp) / heat_rate
+        elapsed += ramp_time + dwell_time
+        rows.append([step, max_temp, dwell_time, ramp_time, elapsed])
+
+    if elapsed / 60.0 > SAFETY_MAX_TOTAL_HOURS:
+        raise ValueError(f"Planned run exceeds {SAFETY_MAX_TOTAL_HOURS:g} hours.")
 
     return pd.DataFrame(rows, columns=TEMP_PLAN_COLUMNS)
 
@@ -658,19 +694,27 @@ class App:
         self.app_root = tk.Tk()
         self.state = RUN_STATE.DONE
         self.run_thread = None
+        self.program_thread = None
         self.pause_requested = False
         self.stop_requested = False
+        self.shutdown_in_progress = False
 
-        # new variables
+        # reference for test setup
+        self.temperature_setup_controls = []
+        self.frequency_setup_controls = []
+        self.manual_command_controls = []
+        self.setup_notebook = None
+
+        # temp setup vars
         self.start_temp = tk.DoubleVar(value=25.0)
         self.step_temp = tk.DoubleVar(value=20.0)
         self.max_temp = tk.DoubleVar(value=125.0)
         self.dwell_time = tk.DoubleVar(value=5.0)
-        self.heat_rate = tk.DoubleVar(value=2.5)
+        self.heat_rate = tk.DoubleVar(value=5.0)
 
         self.first_freq_dvar = tk.DoubleVar(value=devices.LCR_MIN_FREQ)
         self.last_freq_dvar = tk.DoubleVar(value=devices.LCR_MAX_FREQ)
-        self.points_per_decade_ivar = tk.IntVar(value=10)
+        self.points_per_decade_ivar = tk.IntVar(value=8)
         self.custom_freq_dvar = tk.DoubleVar()
 
         self.selected_plot_temp_strvar = tk.StringVar(value="Latest")
@@ -703,6 +747,7 @@ class App:
         self.temperature_rolling_table = pd.DataFrame(
             columns=TEMPERATURE_READINGS_COLUMNS
         )  # rolling table, ~30 entries
+        self.temperature_table_lock = threading.Lock()
         self.readings_lock = threading.Lock()
         self.rolling_lock = threading.Lock()
         self.last_temperature_readings_length = 0
@@ -754,8 +799,33 @@ class App:
 
     # function for confirmation before closing
     def on_closing(self):
-        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+        if bool(self.state & RUN_STATE.RUNNING) or self.state == RUN_STATE.PAUSE:
+            if not messagebox.askokcancel(
+                "Force Stop", "A sequence is active. Force stop the run and exit?"
+            ):
+                return
+            self.on_stop_pressed()
+            if self.run_thread is not None and self.run_thread.is_alive():
+                self.run_thread.join(timeout=5)
+            self.close_devices_and_resources()
             self.app_root.destroy()
+            return
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            self.close_devices_and_resources()
+            self.app_root.destroy()
+
+    def close_devices_and_resources(self):
+        for device in self.device_list:
+            try:
+                if device is not None and hasattr(device, "close"):
+                    device.close()
+            except Exception as e:
+                print(f"Device close error: {e}")
+        try:
+            if hasattr(devices, "close_resource_manager"):
+                devices.close_resource_manager()
+        except Exception as e:
+            print(f"VISA close error: {e}")
 
     def padding(
         self, master, x=0, y=0, side="top", fill="both", expand=False, **kwargs
@@ -788,10 +858,11 @@ class App:
     # MAIN GUI PANELS ---------------------------
     # test setup tab with temperature plan, frequency steps, device communication, and probe selection subtabs
     def build_test_setup(self, master):
-        notebook = ttk.Notebook(
+        self.setup_notebook = ttk.Notebook(
             master,
             style="TNotebook",
         )
+        notebook = self.setup_notebook
         notebook.pack(side="top", fill="both", expand=True)
 
         # Temperature Tab
@@ -1032,9 +1103,12 @@ class App:
         apply_cosmetics(axis)
 
         def t_update_temps(*args):
-            if self.state == RUN_STATE.TEMP_CHANGING:
-                master_length = len(self.temperature_readings_table)
-                rolling_length = len(self.temperature_rolling_table)
+            if self.state & RUN_STATE.RUNNING:
+                with self.temperature_table_lock:
+                    master_table = self.temperature_readings_table.copy()
+                    rolling_table = self.temperature_rolling_table.copy()
+                master_length = len(master_table)
+                rolling_length = len(rolling_table)
                 total_length = master_length + rolling_length
                 if total_length - self.last_temperature_readings_length <= 0:
                     print("Updating Temp Cycle Plot... No Changes")
@@ -1055,15 +1129,11 @@ class App:
                             for index in indicies
                             if index >= master_length
                         ]
-                        master_slice = self.temperature_readings_table.loc[
-                            master_indicies, HEADER_LIST
-                        ]
-                        rolling_slice = self.temperature_rolling_table.loc[
-                            rolling_indicies, HEADER_LIST
-                        ]
+                        master_slice = master_table.loc[master_indicies, HEADER_LIST]
+                        rolling_slice = rolling_table.loc[rolling_indicies, HEADER_LIST]
                     else:
-                        master_slice = self.temperature_readings_table[HEADER_LIST]
-                        rolling_slice = self.temperature_rolling_table[HEADER_LIST]
+                        master_slice = master_table[HEADER_LIST]
+                        rolling_slice = rolling_table[HEADER_LIST]
                     self.last_temperature_readings_length = total_length
                     combined_table = pd.concat(
                         [master_slice, rolling_slice]
@@ -1157,18 +1227,39 @@ class App:
         params = tk.LabelFrame(temperature_tab, text="Step Parameters", padx=8, pady=8)
         params.pack(fill="x", pady=6)
 
-        self._labeled_entry(params, f"Start Temp [{CHAR_DEGC}]", self.start_temp)
-        self._labeled_entry(params, f"Step Size [{CHAR_DEGC}]", self.step_temp)
-        self._labeled_entry(params, f"Max Temp [{CHAR_DEGC}]", self.max_temp)
-        self._labeled_entry(params, "Dwell Time [min]", self.dwell_time)
-        self._labeled_entry(params, f"Heat Ramp [{CHAR_DEGC}/min]", self.heat_rate)
+        self.entry_start_temp = self._labeled_entry(
+            params, f"Start Temp [{CHAR_DEGC}]", self.start_temp
+        )
+        self.entry_step_temp = self._labeled_entry(
+            params, f"Step Size [{CHAR_DEGC}]", self.step_temp
+        )
+        self.entry_max_temp = self._labeled_entry(
+            params, f"Max Temp [{CHAR_DEGC}]", self.max_temp
+        )
+        self.entry_dwell_time = self._labeled_entry(
+            params, "Dwell Time [min]", self.dwell_time
+        )
+        self.entry_heat_rate = self._labeled_entry(
+            params, f"Heat Ramp [{CHAR_DEGC}/min]", self.heat_rate
+        )
 
-        tk.Button(
+        self.generate_plan_button = tk.Button(
             params,
             text="Generate Plan",
             command=self.generate_temperature_plan,
             fg="royalblue",
-        ).pack(pady=(6, 0))
+        )
+        self.generate_plan_button.pack(pady=(6, 0))
+
+        # store temperature entry widgets
+        self.temperature_setup_controls = [
+            self.entry_start_temp,
+            self.entry_step_temp,
+            self.entry_max_temp,
+            self.entry_dwell_time,
+            self.entry_heat_rate,
+            self.generate_plan_button,
+        ]
 
         table_frame = tk.LabelFrame(
             temperature_tab, text="Temperature Plan", padx=6, pady=6
@@ -1225,13 +1316,13 @@ class App:
         low_freq_frame.pack(side="left")
         low_freq_label = tk.Label(master=low_freq_frame, text="First [Hz] ")
         low_freq_label.pack(side="left", fill="y")
-        low_freq_entry = Entry(
+        self.low_freq_entry = Entry(
             master=low_freq_frame,
             width=10,
             justify="right",
             textvariable=self.first_freq_dvar,
         )
-        low_freq_entry.pack(side="left", fill="y")
+        self.low_freq_entry.pack(side="left", fill="y")
 
         high_freq_frame = tk.Frame(
             master=frequency_logspace_box,
@@ -1239,13 +1330,13 @@ class App:
         high_freq_frame.pack(side="left")
         high_freq_label = tk.Label(master=high_freq_frame, text=" to Last [Hz] ")
         high_freq_label.pack(side="left", fill="y")
-        high_freq_entry = Entry(
+        self.high_freq_entry = Entry(
             master=high_freq_frame,
             width=10,
             justify="right",
             textvariable=self.last_freq_dvar,
         )
-        high_freq_entry.pack(side="left", fill="y")
+        self.high_freq_entry.pack(side="left", fill="y")
 
         points_per_decade_frame = tk.Frame(
             master=frequency_logspace_box,
@@ -1255,13 +1346,13 @@ class App:
             master=points_per_decade_frame, text=" @ Points/Dec. "
         )
         points_per_decade_label.pack(side="left", fill="y")
-        points_per_decade_entry = Entry(
+        self.points_per_decade_entry = Entry(
             master=points_per_decade_frame,
             width=7,
             justify="right",
             textvariable=self.points_per_decade_ivar,
         )
-        points_per_decade_entry.pack(side="left", fill="y")
+        self.points_per_decade_entry.pack(side="left", fill="y")
         # points_per_decade_entry.bind("<Return>", lambda *args: print(self.first_freq_dvar.get(), self.last_freq_dvar.get(), self.points_per_decade_ivar.get()))
 
         def sync_freq_tables():
@@ -1276,9 +1367,46 @@ class App:
             self.freq_step_table.update_table(df)
 
         def set_freq_logspace_pressed():
-            minimum_frequency = self.first_freq_dvar.get()
-            maximum_frequency = self.last_freq_dvar.get()
-            points_per_decade = self.points_per_decade_ivar.get()
+            try:
+                minimum_frequency = float(self.first_freq_dvar.get())
+                maximum_frequency = float(self.last_freq_dvar.get())
+                points_per_decade = int(self.points_per_decade_ivar.get())
+            except (ValueError, tk.TclError):
+                messagebox.showerror(
+                    "Invalid Frequencies", "Frequency inputs must be numeric."
+                )
+                return
+            if not all(
+                np.isfinite(value)
+                for value in [minimum_frequency, maximum_frequency, points_per_decade]
+            ):
+                messagebox.showerror(
+                    "Invalid Frequencies", "Frequency inputs must be finite numbers."
+                )
+                return
+            if minimum_frequency < devices.LCR_MIN_FREQ:
+                messagebox.showerror(
+                    "Invalid Frequencies",
+                    f"First frequency must be at least {devices.LCR_MIN_FREQ:g} Hz.",
+                )
+                return
+            if maximum_frequency > devices.LCR_MAX_FREQ:
+                messagebox.showerror(
+                    "Invalid Frequencies",
+                    f"Last frequency must be no more than {devices.LCR_MAX_FREQ:g} Hz.",
+                )
+                return
+            if minimum_frequency >= maximum_frequency:
+                messagebox.showerror(
+                    "Invalid Frequencies",
+                    "First frequency must be less than last frequency.",
+                )
+                return
+            if points_per_decade < 1:
+                messagebox.showerror(
+                    "Invalid Frequencies", "Points per decade must be at least 1."
+                )
+                return
             print(minimum_frequency, maximum_frequency, points_per_decade)
             low_decade = np.log10(minimum_frequency)
             high_decade = np.log10(maximum_frequency)
@@ -1315,14 +1443,14 @@ class App:
         )
         logspace_button_box.pack(side="top", fill="x")
 
-        set_logspace_button = tk.Button(
+        self.set_logspace_button = tk.Button(
             master=logspace_button_box,
             text="Set Logspace",
             command=set_freq_logspace_pressed,
         )
-        set_logspace_button.pack(side="top")
-        points_per_decade_entry.bind(
-            "<Return>", lambda *args: set_logspace_button.invoke()
+        self.set_logspace_button.pack(side="top")
+        self.points_per_decade_entry.bind(
+            "<Return>", lambda *args: self.set_logspace_button.invoke()
         )
 
         # Frequency list tables
@@ -1361,13 +1489,13 @@ class App:
         manual_freq_frame.pack(side="top", fill="x")
         manual_freq_label = tk.Label(master=manual_freq_frame, text="Manual [Hz] ")
         manual_freq_label.pack(side="left")
-        manual_freq_entry = Entry(
+        self.manual_freq_entry = Entry(
             master=manual_freq_frame,
             width=10,
             justify="right",
             textvariable=self.custom_freq_dvar,
         )
-        manual_freq_entry.pack(side="left")
+        self.manual_freq_entry.pack(side="left")
         button_row = tk.Frame(
             master=setting_buttons_box,
             padx=10,
@@ -1377,10 +1505,38 @@ class App:
 
         def add_manual_freq_pressed(*args):
             print("add step")
-            freq = self.custom_freq_dvar.get()
+            try:
+                freq = float(self.custom_freq_dvar.get())
+            except (ValueError, tk.TclError):
+                messagebox.showerror(
+                    "Invalid Frequency", "Manual frequency must be numeric."
+                )
+                return
+            if not np.isfinite(freq):
+                messagebox.showerror(
+                    "Invalid Frequency", "Manual frequency must be finite."
+                )
+                return
+            if freq < devices.LCR_MIN_FREQ or freq > devices.LCR_MAX_FREQ:
+                messagebox.showerror(
+                    "Invalid Frequency",
+                    f"Manual frequency must be between {devices.LCR_MIN_FREQ:g} and {devices.LCR_MAX_FREQ:g} Hz.",
+                )
+                return
             df = self.custom_freq_data
-            if freq in self.freq_step_data[FREQ_STEP_COLUMNS[1]].values:
-                print(f"{freq} Hz exists in sequence!")
+            existing = pd.concat(
+                [self.freq_step_data, self.custom_freq_data],
+                ignore_index=True,
+            )
+            existing_freqs = pd.to_numeric(
+                existing.get(FREQ_STEP_COLUMNS[1], pd.Series(dtype=float)),
+                errors="coerce",
+            )
+            if any(np.isclose(existing_freqs.dropna(), freq, rtol=1e-9, atol=1e-9)):
+                messagebox.showwarning(
+                    "Duplicate Frequency",
+                    f"{freq:g} Hz already exists in the frequency list.",
+                )
                 return
             print([freq, "*"])
             print(self.custom_freq_data)
@@ -1388,13 +1544,15 @@ class App:
             print(self.custom_freq_data)
             sync_freq_tables()
 
-        add_setting_button = tk.Button(
+        self.add_freq_button = tk.Button(
             master=button_row,
             text="Add Step",
             command=add_manual_freq_pressed,
         )
-        add_setting_button.pack(side="left", expand=True)
-        manual_freq_entry.bind("<Return>", lambda *args: add_setting_button.invoke())
+        self.add_freq_button.pack(side="left", expand=True)
+        self.manual_freq_entry.bind(
+            "<Return>", lambda *args: self.add_freq_button.invoke()
+        )
 
         def drop_manual_freq_pressed(*args):
             df = self.custom_freq_data
@@ -1403,14 +1561,14 @@ class App:
             self.custom_freq_data = df.drop(df.tail(1).index)
             sync_freq_tables()
 
-        remove_setting_button = tk.Button(
+        self.remove_freq_button = tk.Button(
             master=button_row,
             text="Drop Step",
             command=drop_manual_freq_pressed,
         )
-        remove_setting_button.pack(side="left", expand=True)
-        manual_freq_entry.bind(
-            "<Shift-Return>", lambda *args: remove_setting_button.invoke()
+        self.remove_freq_button.pack(side="left", expand=True)
+        self.manual_freq_entry.bind(
+            "<Shift-Return>", lambda *args: self.remove_freq_button.invoke()
         )
 
         def clear_manual_freqs_pressed(*args):
@@ -1420,12 +1578,23 @@ class App:
             self.custom_freq_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
             sync_freq_tables()
 
-        clear_setting_button = tk.Button(
+        self.clear_freq_button = tk.Button(
             master=setting_buttons_box,
             text="Clear List",
             command=clear_manual_freqs_pressed,
         )
-        clear_setting_button.pack(side="top", expand=True)
+        self.clear_freq_button.pack(side="top", expand=True)
+
+        self.frequency_setup_controls = [
+            self.low_freq_entry,
+            self.high_freq_entry,
+            self.points_per_decade_entry,
+            self.set_logspace_button,
+            self.manual_freq_entry,
+            self.add_freq_button,
+            self.remove_freq_button,
+            self.clear_freq_button,
+        ]
 
         # Custom freq table
         tk.Frame(master=left_side_box, height=10).pack(side="top", fill="x")
@@ -1521,12 +1690,12 @@ class App:
         #     master=message_labelframe,
         #     text="CMD: ",
         # ); message_label.pack(side='left')
-        message_entry = Entry(
+        self.manual_message_entry = Entry(
             master=message_labelframe,
             justify="left",
             textvariable=self.message_strvar,
         )
-        message_entry.pack(side="left", fill="x", expand=True)
+        self.manual_message_entry.pack(side="left", fill="x", expand=True)
 
         try:
             # self.device_list = devices.SunSystemsOven_EC1A()
@@ -1536,13 +1705,29 @@ class App:
             pass  # TODO: Separate process looping device connection/communication
 
         self.padding(message_labelframe, x=10, side="left")
-        send_button = tk.Button(
+
+        def manual_send_pressed():
+            if self.is_sequence_active():
+                messagebox.showwarning(
+                    "Sequence Active",
+                    "Manual device commands are disabled while a sequence is active.",
+                )
+                return
+            threading.Thread(target=self.device_msg, daemon=True).start()
+
+        self.manual_send_button = tk.Button(
             master=message_labelframe,
             text="Send",
-            command=lambda *args: threading.Thread(target=self.device_msg).start(),
+            command=manual_send_pressed,
         )
-        send_button.pack(side="right")
-        message_entry.bind("<Return>", lambda *args: send_button.invoke())
+        self.manual_send_button.pack(side="right")
+        self.manual_message_entry.bind(
+            "<Return>", lambda *args: self.manual_send_button.invoke()
+        )
+        self.manual_command_controls = [
+            self.manual_message_entry,
+            self.manual_send_button,
+        ]
 
         self.padding(devices_tab, y=10, side="top")
         response_frame = tk.LabelFrame(
@@ -1581,6 +1766,12 @@ class App:
 
     # helper function utilizing the build_temperature_plan function to generate the temperature plan dataframe based on the current input parameters
     def generate_temperature_plan(self):
+        if self.is_sequence_active():
+            messagebox.showwarning(
+                "Sequence Active",
+                "Temperature plan cannot be edited while a sequence is active.",
+            )
+            return
         try:
             self.temp_step_data = build_temperature_plan(
                 self.start_temp.get(),
@@ -1606,10 +1797,25 @@ class App:
 
     # combine into one dataframe for export
     def get_temperature_log(self):
-        return pd.concat(
-            [self.temperature_readings_table, self.temperature_rolling_table],
-            ignore_index=True,
-        )
+        with self.temperature_table_lock:
+            return pd.concat(
+                [self.temperature_readings_table, self.temperature_rolling_table],
+                ignore_index=True,
+            )
+
+    def append_temperature_log_row(self, row):
+        with self.temperature_table_lock:
+            self.temperature_rolling_table.loc[len(self.temperature_rolling_table)] = (
+                row
+            )
+            if len(self.temperature_rolling_table) >= TEMPERATURE_ROLLING_MAX_ROWS:
+                self.temperature_readings_table = pd.concat(
+                    [self.temperature_readings_table, self.temperature_rolling_table],
+                    ignore_index=True,
+                )
+                self.temperature_rolling_table = pd.DataFrame(
+                    columns=TEMPERATURE_READINGS_COLUMNS
+                )
 
     # gets most recent measurement
     def get_display_measurements(self):
@@ -1686,12 +1892,13 @@ class App:
     # clears data func
     def reset_measurement_data(self):
         self.test_data = pd.DataFrame(columns=TEST_DATA_COLUMNS)
-        self.temperature_readings_table = pd.DataFrame(
-            columns=TEMPERATURE_READINGS_COLUMNS
-        )
-        self.temperature_rolling_table = pd.DataFrame(
-            columns=TEMPERATURE_READINGS_COLUMNS
-        )
+        with self.temperature_table_lock:
+            self.temperature_readings_table = pd.DataFrame(
+                columns=TEMPERATURE_READINGS_COLUMNS
+            )
+            self.temperature_rolling_table = pd.DataFrame(
+                columns=TEMPERATURE_READINGS_COLUMNS
+            )
 
         self.last_temperature_readings_length = 0
 
@@ -1822,6 +2029,14 @@ class App:
 
     # exporting function
     def export_results(self):
+
+        if self.is_sequence_active():
+            messagebox.showwarning(
+                "Sequence Active",
+                "Export is disabled while programming or running. Stop or finish the run before exporting.",
+            )
+            return
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = f"HT-BDS_{timestamp}.xlsx"
 
@@ -2103,14 +2318,16 @@ class App:
             user_temp = np.nan
 
         elapsed_time = time.time() - start_time
-        self.temperature_rolling_table.loc[len(self.temperature_rolling_table)] = [
-            elapsed_time,
-            step_num,
-            mode,
-            target,
-            chamber_temp,
-            user_temp,
-        ]
+        self.append_temperature_log_row(
+            [
+                elapsed_time,
+                step_num,
+                mode,
+                target,
+                chamber_temp,
+                user_temp,
+            ]
+        )
         return chamber_temp, user_temp
 
     # general function for sending commands
@@ -2142,25 +2359,41 @@ class App:
 
         return (code, reply)
 
+    def show_error_threadsafe(self, title: str, message: str):
+        self.app_root.after(0, lambda: messagebox.showerror(title, message))
+
+    def checked_device_msg(
+        self,
+        device,
+        query: str,
+        context: str = "Device Command",
+        read_after_write=False,
+    ):
+        code, reply = self.device_msg(
+            device=device, query=query, hused=True, read_after_write=read_after_write
+        )
+
+        if code < 0:
+            raise RuntimeError(f"{context} failed: {query} -> {reply}")
+
+        return code, reply
+
     # function to program the device with the generated temperature plan
     def program_device(self, cfg: RunConfig):
-        self.generate_temperature_plan()
         self.state = RUN_STATE.PROGRAMMING
         oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
 
         print("Programming ...")
         if oven is None:
             print("... Programming failed! No device attached!")
-            messagebox.showerror("Error!", "No device connected!")
+            self.show_error_threadsafe("Error!", "No device connected!")
             self.state = RUN_STATE.IDLE
             return
         if not oven:
             print("... Programming failed! Active device is not a SunSystemsOven_EC1A!")
-            messagebox.showerror("Error!", "Device is not a compatible oven!")
+            self.show_error_threadsafe("Error!", "Device is not a compatible oven!")
             self.state = RUN_STATE.IDLE
             return
-
-        self.generate_temperature_plan()  # ensure plan is up to date before programming
 
         if self.temp_step_data.empty:
             print("... Programming failed! Temperature plan is empty!")
@@ -2182,8 +2415,8 @@ class App:
             dwell = float(row[TEMP_PLAN_COLUMNS[2]])
 
             self.device_msg(device=oven, query=f"RATE={cfg.heat_rate:.2f}")
-            self.device_msg(device=oven, query=f"WAIT={minutes_to_wait(dwell)}")
             self.device_msg(device=oven, query=f"SET={target:.1f}")
+            self.device_msg(device=oven, query=f"WAIT={minutes_to_wait(dwell)}")
 
             self.device_msg(device=oven, query=f"BKPNT {step_num}")
 
@@ -2253,7 +2486,10 @@ class App:
         values = []
         for part in parts:
             try:
-                values.append(float(part.strip()))
+                value = float(part.strip())
+                if abs(value) >= KEYSIGHT_OVERRANGE_THRESHOLD:
+                    value = np.nan
+                values.append(value)
             except ValueError:
                 pass
 
@@ -2264,38 +2500,100 @@ class App:
 
     # measure lcr at a specific frequency
     def measure_lcr_at_freq(self, lcr, freq_hz: float):
-        # Cp & Df measurements
-        self.device_msg(device=lcr, query="*CLS", hushed=True)
-        self.device_msg(device=lcr, query=":FUNC:IMP:TYPE CPD", hushed=True)
-        self.device_msg(device=lcr, query=f":FREQ:CW {freq_hz}", hushed=True)
-        self.device_msg(device=lcr, query=":FUNC:IMP:RANG:AUTO ON", hushed=True)
-        self.device_msg(device=lcr, query=":TRIG:SOUR BUS", hushed=True)
-        self.device_msg(device=lcr, query=":INIT:CONT OFF", hushed=True)
-        self.device_msg(device=lcr, query=":INIT", hushed=True)
-        self.device_msg(device=lcr, query="*TRG", hushed=True)
+        def checked_send(command):
+            code, reply = self.device_msg(device=lcr, query=command, hushed=True)
+            if code < 0:
+                raise RuntimeError(f"LCR command failed: {command} -> {reply}")
+            return reply
 
-        _, cpd_reply = self.device_msg(device=lcr, query=":FETC:IMP:FORM?", hushed=True)
+        for command in [
+            "*CLS",
+            ":FUNC:IMP:TYPE CPD",
+            f":FREQ:CW {freq_hz}",
+            ":FUNC:IMP:RANG:AUTO ON",
+            ":TRIG:SOUR BUS",
+            ":INIT:CONT OFF",
+            ":INIT",
+            "*TRG",
+            "*WAI",
+        ]:
+            checked_send(command)
+        checked_send("*OPC?")
+
+        cpd_reply = checked_send(":FETC:IMP:FORM?")
         cp, df = self.parse_lcr_reply(cpd_reply)
 
-        # Cs & Rs measurements
-        self.device_msg(device=lcr, query=":FUNC:IMP:TYPE CSRS", hushed=True)
-        self.device_msg(device=lcr, query=f":FREQ:CW {freq_hz}", hushed=True)
-        self.device_msg(device=lcr, query=":INIT", hushed=True)
-        self.device_msg(device=lcr, query="*TRG", hushed=True)
+        for command in [
+            ":FUNC:IMP:TYPE CSRS",
+            f":FREQ:CW {freq_hz}",
+            ":INIT",
+            "*TRG",
+            "*WAI",
+        ]:
+            checked_send(command)
+        checked_send("*OPC?")
 
-        _, csrs_reply = self.device_msg(
-            device=lcr, query=":FETC:IMP:FORM?", hushed=True
-        )
+        csrs_reply = checked_send(":FETC:IMP:FORM?")
         _, esr = self.parse_lcr_reply(csrs_reply)
 
         return cp, df, esr
 
+    def is_sequence_active(self):
+        return bool(self.state & RUN_STATE.RUNNING) or self.state in (
+            RUN_STATE.PROGRAMMING,
+            RUN_STATE.PAUSE,
+        )
+
+    def set_widgets_enabled(self, widgets, enabled: bool):
+        state_value = "normal" if enabled else "disabled"
+        for widget in widgets:
+            try:
+                widget.config(state=state_value)
+            except Exception:
+                pass
+
+    def set_setup_controls_enabled(self, enabled: bool):
+        self.set_widgets_enabled(self.temperature_setup_controls, enabled)
+        self.set_widgets_enabled(self.frequency_setup_controls, enabled)
+        if self.setup_notebook is not None:
+            for index in (0, 1):
+                try:
+                    self.setup_notebook.tab(
+                        index, state="normal" if enabled else "disabled"
+                    )
+                except Exception:
+                    pass
+
+    def set_manual_command_enabled(self, enabled: bool):
+        self.set_widgets_enabled(self.manual_command_controls, enabled)
+
+    def validate_frequency_list(self, freqs):
+        if not freqs:
+            raise ValueError("Frequency list is empty.")
+        for freq in freqs:
+            try:
+                value = float(freq)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid frequency value: {freq!r}")
+            if not np.isfinite(value):
+                raise ValueError("Frequency list contains a non-finite value.")
+            if value < devices.LCR_MIN_FREQ or value > devices.LCR_MAX_FREQ:
+                raise ValueError(
+                    f"Frequency {value:g} Hz is outside the LCR range "
+                    f"{devices.LCR_MIN_FREQ:g} to {devices.LCR_MAX_FREQ:g} Hz."
+                )
+
+    def frequency_plan_is_empty(self):
+        return self.freq_step_data.empty and self.custom_freq_data.empty
+
     # state controls
     def set_controls_idle(self):
-        self.program_button.config(state="normal")
+        self.program_button.config(state="normal", text="Program")
         self.run_button.config(state="disabled", text="Run")
         self.pause_button.config(state="disabled", text="Pause")
-        self.stop_button.config(state="disabled")
+        self.stop_button.config(state="disabled", text="Stop")
+        self.set_setup_controls_enabled(True)
+        self.set_manual_command_enabled(True)
 
         if hasattr(self, "new_run_button"):
             self.new_run_button.config(state="normal")
@@ -2303,10 +2601,12 @@ class App:
             self.export_button.config(state="normal")
 
     def set_controls_programmed(self):
-        self.program_button.config(state="normal")
+        self.program_button.config(state="normal", text="Program")
         self.run_button.config(state="normal", text="Run")
         self.pause_button.config(state="disabled", text="Pause")
-        self.stop_button.config(state="normal")
+        self.stop_button.config(state="normal", text="Stop")
+        self.set_setup_controls_enabled(True)
+        self.set_manual_command_enabled(True)
 
         if hasattr(self, "new_run_button"):
             self.new_run_button.config(state="normal")
@@ -2314,10 +2614,25 @@ class App:
             self.export_button.config(state="normal")
 
     def set_controls_running(self):
-        self.program_button.config(state="disabled")
+        self.program_button.config(state="disabled", text="Program")
         self.run_button.config(state="disabled", text="Running")
         self.pause_button.config(state="normal", text="Pause")
-        self.stop_button.config(state="normal")
+        self.stop_button.config(state="normal", text="Stop")
+        self.set_setup_controls_enabled(False)
+        self.set_manual_command_enabled(False)
+
+        if hasattr(self, "new_run_button"):
+            self.new_run_button.config(state="disabled")
+            self.clear_data_button.config(state="disabled")
+            self.export_button.config(state="disabled")
+
+    def set_controls_programming(self):
+        self.program_button.config(state="disabled", text="Programming")
+        self.run_button.config(state="disabled", text="Run")
+        self.pause_button.config(state="disabled", text="Pause")
+        self.stop_button.config(state="disabled", text="Stop")
+        self.set_setup_controls_enabled(False)
+        self.set_manual_command_enabled(False)
 
         if hasattr(self, "new_run_button"):
             self.new_run_button.config(state="disabled")
@@ -2325,20 +2640,63 @@ class App:
             self.export_button.config(state="disabled")
 
     def on_program_pressed(self):
-        def worker():
-            self.program_device(self.get_run_data())
-            if self.state == RUN_STATE.READY:
-                self.app_root.after(0, self.set_controls_programmed)
+        if self.is_sequence_active():
+            messagebox.showwarning(
+                "Sequence Active", "Cannot program while a sequence is active."
+            )
+            return
+        self.generate_temperature_plan()
+        if self.temp_step_data.empty:
+            return
+        cfg = self.get_run_data()
+        self.state = RUN_STATE.PROGRAMMING
+        self.set_controls_programming()
 
-        threading.Thread(target=worker, daemon=True).start()
+        def worker():
+            self.program_device(cfg)
+
+            def finish_programming():
+                if self.state == RUN_STATE.READY:
+                    self.set_controls_programmed()
+                else:
+                    self.set_controls_idle()
+
+            self.app_root.after(0, finish_programming)
+
+        self.program_thread = threading.Thread(target=worker, daemon=True)
+        self.program_thread.start()
 
     def on_run_pressed(self):
+        if self.run_thread is not None and self.run_thread.is_alive():
+            messagebox.showwarning("Run Active", "A run is already active.")
+            return
+        cfg = self.get_run_data()
+        freqs = self.get_frequency_list()
+        try:
+            self.validate_frequency_list(freqs)
+        except ValueError as e:
+            messagebox.showerror("Invalid Frequency List", str(e))
+            return
+        if self.frequency_plan_is_empty() and freqs == [DEFAULT_FOCUS_FREQ_HZ]:
+            if not messagebox.askyesno(
+                "No Frequency Plan",
+                f"No frequency plan is selected. Continue with only {DEFAULT_FOCUS_FREQ_HZ:g} Hz?",
+            ):
+                return
+        if cfg.max_temp >= SAFETY_CONFIRM_TEMP_C:
+            confirmed = messagebox.askyesno(
+                "High Temperature Confirmation",
+                f"This run reaches {cfg.max_temp:g} {CHAR_DEGC}.\n\nConfirm the sample, fixture, chamber, and safety conditions are ready.",
+            )
+            if not confirmed:
+                return
         self.pause_requested = False
         self.stop_requested = False
         self.set_controls_running()
+        frozen_freqs = tuple(freqs)
 
         self.run_thread = threading.Thread(
-            target=lambda: self.run(self.get_run_data()),
+            target=lambda: self.run(cfg, frozen_freqs),
             daemon=True,
         )
         self.run_thread.start()
@@ -2365,6 +2723,9 @@ class App:
         self.stop_requested = True
         self.pause_requested = False
         self.state = RUN_STATE.DONE
+        self.stop_button.config(text="Stopping...", state="disabled")
+        self.pause_button.config(state="disabled")
+        self.run_button.config(state="disabled")
 
         oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
 
@@ -2373,10 +2734,37 @@ class App:
             self.device_msg(device=oven, query="COFF")
             self.device_msg(device=oven, query="HOFF")
 
-        self.set_controls_idle()
+        if self.run_thread is None or not self.run_thread.is_alive():
+            self.set_controls_idle()
+
+    def wait_for_oven_breakpoint(
+        self, oven, start_time, step_num, target, max_wait_seconds
+    ):
+        deadline = time.time() + max_wait_seconds
+        while time.time() < deadline:
+            if self.stop_requested:
+                return False
+            while self.pause_requested and not self.stop_requested:
+                time.sleep(0.5)
+            chamber_temp, user_temp = self.log_oven_temperature(
+                oven, start_time, step_num, target, mode="Temp Changing"
+            )
+            try:
+                chunk = max(
+                    1, min(OVEN_WAIT_CHUNK_SECONDS, int(deadline - time.time()))
+                )
+                oven.wait_interrupt(chunk)
+                return True
+            except Exception:
+                print(f"Step {step_num}: no SRQ yet; continuing to wait...")
+            for _ in range(10):
+                if self.stop_requested:
+                    return False
+                time.sleep(0.5)
+        raise TimeoutError(f"Breakpoint wait timed out at step {step_num}.")
 
     # function to execute the programmed temperature plan and perform measurements at each step, with error handling and timeouts to ensure safe operation
-    def run(self, cfg: RunConfig):
+    def run(self, cfg: RunConfig, frequency_list=None):
         self.state = RUN_STATE.TEMP_CHANGING
         # devices
         oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
@@ -2385,31 +2773,39 @@ class App:
         # check devices
         if all(device is None for device in self.device_list):
             print("Run failed: No devices connected")
-            messagebox.showerror("Error!", "No devices are connected!")
+            self.show_error_threadsafe("Error!", "No devices are connected!")
             self.state = RUN_STATE.IDLE
+            self.app_root.after(0, self.set_controls_idle)
             return
         if lcr is None:
             print("Run failed: LCR is not connected")
-            messagebox.showerror("Error!", "LCR is not connected!")
+            self.show_error_threadsafe("Error!", "LCR is not connected!")
             self.state = RUN_STATE.IDLE
+            self.app_root.after(0, self.set_controls_idle)
             return
         if oven is None:
             print("Run Failed: No oven connected")
-            messagebox.showerror("Error!", "No oven connected!")
+            self.show_error_threadsafe("Error!", "No oven connected!")
             self.state = RUN_STATE.IDLE
+            self.app_root.after(0, self.set_controls_idle)
             return
         if not isinstance(oven, devices.SunSystemsOven_EC1A):
             print("Run Failed: Active device is not a SunSystemsOven_EC1A")
             self.state = RUN_STATE.IDLE
+            self.app_root.after(0, self.set_controls_idle)
             return
         if self.temp_step_data.empty:
-            self.generate_temperature_plan()
-            if self.temp_step_data.empty:
-                print("Run Failed: Temperature plan is empty")
-                messagebox.showerror("Error!", "No temperature plan!")
-                self.state = RUN_STATE.IDLE
-                return
+            print("Run Failed: Temperature plan is empty")
+            self.show_error_threadsafe("Error!", "No temperature plan!")
+            self.state = RUN_STATE.IDLE
+            self.app_root.after(0, self.set_controls_idle)
+            return
 
+        freqs = (
+            list(frequency_list)
+            if frequency_list is not None
+            else self.get_frequency_list()
+        )
         start_time = time.time()
 
         try:
@@ -2433,41 +2829,20 @@ class App:
                 self.state = RUN_STATE.TEMP_CHANGING
 
                 max_wait_seconds = int(
-                    (ramp_time + dwell + 2) * 60
+                    (ramp_time + dwell + OVEN_BREAKPOINT_TIMEOUT_BUFFER_MINUTES) * 60
                 )  # add buffer time to ensure step completion before timeout
 
-                wait_done = threading.Event()
-
-                def wait_for_breakpoint():
-                    try:
-                        print("Waiting for SRQ...")
-                        oven.wait_interrupt(max_wait_seconds)
-                        print("SRQ received")
-                    except Exception as e:
-                        print(f"Breakpoint wait failed or timed out at {step_num}: {e}")
-                    finally:
-                        wait_done.set()
-
-                wait_thread = threading.Thread(target=wait_for_breakpoint, daemon=True)
-                wait_thread.start()
-
-                while not wait_done.is_set():
-                    if self.stop_requested:
-                        print("Stop requested while waiting.")
-                        break
-                    while self.pause_requested and not self.stop_requested:
-                        time.sleep(0.5)
-                    chamber_temp, user_temp = self.log_oven_temperature(
-                        oven, start_time, step_num, target, mode="Temp Changing"
-                    )
-
-                    for _ in range(10):
-                        if self.stop_requested:
-                            break
-                        time.sleep(0.5)
+                breakpoint_reached = self.wait_for_oven_breakpoint(
+                    oven, start_time, step_num, target, max_wait_seconds
+                )
+                if not breakpoint_reached:
+                    print("Stop requested while waiting.")
+                    break
 
                 if self.stop_requested:
-                    print("Stop requested before user temperature stabilization can be reached.")
+                    print(
+                        "Stop requested before user temperature stabilization can be reached."
+                    )
                     self.state = RUN_STATE.DONE
                     self.app_root.after(0, self.set_controls_idle)
                     return
@@ -2481,23 +2856,25 @@ class App:
                 )
 
                 if self.stop_requested:
-                    print("Stop requested before user temperature stabilization can be reached.")
+                    print(
+                        "Stop requested before user temperature stabilization can be reached."
+                    )
                     self.state = RUN_STATE.DONE
                     self.app_root.after(0, self.set_controls_idle)
                     return
 
                 elapsed_time = time.time() - start_time
 
-                self.temperature_rolling_table.loc[
-                    len(self.temperature_rolling_table)
-                ] = [
-                    elapsed_time,
-                    step_num,
-                    "Measurement Start",
-                    target,
-                    chamber_temp,
-                    user_temp,
-                ]
+                self.append_temperature_log_row(
+                    [
+                        elapsed_time,
+                        step_num,
+                        "Measurement Start",
+                        target,
+                        chamber_temp,
+                        user_temp,
+                    ]
+                )
 
                 print(
                     f"Step {step_num} ready for measurememt. "
@@ -2506,7 +2883,6 @@ class App:
                 )
 
                 self.state = RUN_STATE.LCR_MEASURING
-                freqs = self.get_frequency_list()
                 if self.stop_requested:
                     break
                 for freq in freqs:
@@ -2517,7 +2893,15 @@ class App:
                         time.sleep(0.5)
                     if self.stop_requested:
                         print("Stop requested before LCR measurement.")
-                    cp, df, esr = self.measure_lcr_at_freq(lcr, freq)
+                        break
+                    try:
+                        cp, df, esr = self.measure_lcr_at_freq(lcr, freq)
+                    except Exception as e:
+                        print(
+                            f"LCR measurement failed at step {step_num}, "
+                            f"frequency {freq:g} Hz: {type(e).__name__}: {e}"
+                        )
+                        cp, df, esr = np.nan, np.nan, np.nan
                     self.test_data.loc[len(self.test_data)] = [
                         1,
                         user_temp,
@@ -2542,7 +2926,14 @@ class App:
 
         except Exception as e:
             print(f"Run Failed: {e}")
+            self.pause_requested = False
+            self.stop_requested = False
+            if oven is not None:
+                self.device_msg(device=oven, query="STOP", hushed=True)
+                self.device_msg(device=oven, query="COFF", hushed=True)
+                self.device_msg(device=oven, query="HOFF", hushed=True)
             self.state = RUN_STATE.IDLE
+            self.show_error_threadsafe("Run Error", f"{type(e).__name__}: {e}")
             self.app_root.after(0, self.set_controls_idle)
 
     def stop(self):
