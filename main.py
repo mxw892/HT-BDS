@@ -6,6 +6,7 @@
 # ===============================================================================
 
 from dataclasses import dataclass
+import colorsys
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -22,6 +23,16 @@ import pandas as pd
 from enum import IntFlag, auto
 import threading
 from datetime import datetime
+
+try:
+    import nidaqmx
+    from nidaqmx.constants import LineGrouping
+except Exception as e:
+    nidaqmx = None
+    LineGrouping = None
+    NIDAQMX_IMPORT_ERROR = e
+else:
+    NIDAQMX_IMPORT_ERROR = None
 
 # ===============================================================================
 # DEVICE IMPORTS & OUTPUT SETUP
@@ -66,13 +77,16 @@ UNITS: dict[str, float] = {
 # Columns
 FREQ_STEP_COLUMNS = ("Step #", "Frequency [Hz]", "*")
 TEST_DATA_COLUMNS = (
-    "Probe #",
+    "Probe Index",
+    "Probe Label",
+    "Probe Color",
     f"Temp. [{CHAR_DEGC}]",
     "Freq. [Hz]",
     "Cp [F]",
     "Df [1]",
     f"ESR [{CHAR_OHM}]",
 )
+PROBE_TABLE_COLUMNS = ("Probe Index", "Probe Label", "Probe Color")
 TEMPERATURE_READINGS_COLUMNS = (
     "Time [s]",
     "Cycle",
@@ -92,6 +106,28 @@ TEMP_PLAN_COLUMNS = (
 # display constants
 DEFAULT_FOCUS_FREQ_HZ = 1000.0
 MEASUREMENT_DISPLAY_ROWS = 50
+PROBE_COLOR_PALETTE = (
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+)
+DAQ_DEVICE_NAME = "Dev1"
+DAQ_PORT0_LINE_SPEC = f"{DAQ_DEVICE_NAME}/port0/line0:7"
+PROBE_SWITCH_PATTERNS = {
+    1: 0b00000011,
+    2: 0b00001100,
+    3: 0b00110000,
+    4: 0b11000000,
+}
+PROBE_ALL_OFF_PATTERN = 0b00000000
+PROBE_BREAK_BEFORE_MAKE_SECONDS = 0.10
 
 # conservative software safety limits
 SAFETY_MIN_TEMP_C = -70.0
@@ -154,6 +190,9 @@ class RunConfig:
     dwell_time: float
     heat_rate: float
     focus_freq: float
+    enable_multiprobe: bool
+    probe_configs: tuple[tuple[int, str, str], ...]
+    probe_settling_delay: float
 
 
 # ================================================================================
@@ -161,7 +200,25 @@ class RunConfig:
 # ===============================================================================
 
 
-def build_temperature_plan(start_temp, step_temp, max_temp, dwell_time, heat_rate):
+def get_default_probe_color(probe_index):
+    if probe_index <= len(PROBE_COLOR_PALETTE):
+        return PROBE_COLOR_PALETTE[probe_index - 1]
+
+    hue = ((probe_index - 1) * 0.618033988749895) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.65, 0.78)
+    return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+
+
+def build_temperature_plan(
+    start_temp,
+    step_temp,
+    max_temp,
+    dwell_time,
+    heat_rate,
+    use_second_step=False,
+    step_change_temp=None,
+    step2_temp=None,
+):
     if step_temp <= 0:
         raise ValueError("Step temp must be greater than 0.")
     if step_temp > SAFETY_MAX_STEP_C:
@@ -187,31 +244,83 @@ def build_temperature_plan(start_temp, step_temp, max_temp, dwell_time, heat_rat
             f"Heat ramp rate must be {SAFETY_MAX_RAMP_C_PER_MIN:g} {CHAR_DEGC}/min or less."
         )
 
-    rows = []
-    elapsed = 0.0
-    step = 1
-    current_temp = start_temp
-    target = start_temp
+    if use_second_step:
+        if step2_temp is None:
+            raise ValueError("Step temp 2 must be specified.")
+        if step2_temp <= 0:
+            raise ValueError("Step temp 2 must be greater than 0.")
+        if step2_temp > SAFETY_MAX_STEP_C:
+            raise ValueError(
+                f"Step temp 2 must be {SAFETY_MAX_STEP_C:g} {CHAR_DEGC} or less."
+            )
+        if step_change_temp is None:
+            raise ValueError("Step change temp must be specified.")
+        if step_change_temp <= start_temp:
+            raise ValueError("Step change temp must be greater than start temp.")
+        if step_change_temp >= max_temp:
+            raise ValueError("Step change temp must be less than max temp.")
 
-    while target < max_temp:
-        ramp_time = abs(target - current_temp) / heat_rate
+    def build_rows(targets):
+        rows = []
+        elapsed = 0.0
+        current_temp = start_temp
+        for step, target in enumerate(targets, start=1):
+            ramp_time = abs(target - current_temp) / heat_rate
+            elapsed += ramp_time + dwell_time
+            rows.append([step, target, dwell_time, ramp_time, elapsed])
+            current_temp = target
 
-        elapsed += ramp_time + dwell_time
-        rows.append([step, target, dwell_time, ramp_time, elapsed])
+        if elapsed / 60.0 > SAFETY_MAX_TOTAL_HOURS:
+            raise ValueError(f"Planned run exceeds {SAFETY_MAX_TOTAL_HOURS:g} hours.")
 
-        current_temp = target
+        return pd.DataFrame(rows, columns=TEMP_PLAN_COLUMNS)
+
+    if not use_second_step:
+        rows = []
+        elapsed = 0.0
+        step = 1
+        current_temp = start_temp
+        target = start_temp
+
+        while target < max_temp:
+            ramp_time = abs(target - current_temp) / heat_rate
+
+            elapsed += ramp_time + dwell_time
+            rows.append([step, target, dwell_time, ramp_time, elapsed])
+
+            current_temp = target
+            target += step_temp
+            step += 1
+
+        if not np.isclose(current_temp, max_temp):
+            ramp_time = abs(max_temp - current_temp) / heat_rate
+            elapsed += ramp_time + dwell_time
+            rows.append([step, max_temp, dwell_time, ramp_time, elapsed])
+
+        if elapsed / 60.0 > SAFETY_MAX_TOTAL_HOURS:
+            raise ValueError(f"Planned run exceeds {SAFETY_MAX_TOTAL_HOURS:g} hours.")
+
+        return pd.DataFrame(rows, columns=TEMP_PLAN_COLUMNS)
+
+    targets = [start_temp]
+    target = start_temp + step_temp
+
+    while target < step_change_temp and not np.isclose(target, step_change_temp):
+        targets.append(target)
         target += step_temp
-        step += 1
 
-    if not np.isclose(current_temp, max_temp):
-        ramp_time = abs(max_temp - current_temp) / heat_rate
-        elapsed += ramp_time + dwell_time
-        rows.append([step, max_temp, dwell_time, ramp_time, elapsed])
+    if not np.isclose(targets[-1], step_change_temp):
+        targets.append(step_change_temp)
 
-    if elapsed / 60.0 > SAFETY_MAX_TOTAL_HOURS:
-        raise ValueError(f"Planned run exceeds {SAFETY_MAX_TOTAL_HOURS:g} hours.")
+    target = step_change_temp + step2_temp
+    while target < max_temp and not np.isclose(target, max_temp):
+        targets.append(target)
+        target += step2_temp
 
-    return pd.DataFrame(rows, columns=TEMP_PLAN_COLUMNS)
+    if not np.isclose(targets[-1], max_temp):
+        targets.append(max_temp)
+
+    return build_rows(targets)
 
 
 def minutes_to_wait(minutes: float) -> str:
@@ -309,7 +418,6 @@ class Table(ttk.Treeview):
     # updates the whole table based on the given dataframe, with alternating row colors
     def update_table(self, dataframe: pd.DataFrame):
         # Add data with alternating row colors
-        # TODO: Fix reiterating whole table for everything ADDED APPEND ROW
         self.delete(*self.get_children())
         for i, data in enumerate(dataframe.itertuples(index=False, name=None)):
             if self.index_inc:
@@ -473,14 +581,19 @@ class TestDataPlot:
         cp_col = "Cp [F]"
         df_col = "Df [1]"
         esr_col = f"ESR [{CHAR_OHM}]"
+        probe_index_col = "Probe Index"
+        probe_label_col = "Probe Label"
+        probe_color_col = "Probe Color"
         plot_df = dataframe.copy()
 
-        for col in [freq_col, temp_col, cp_col, df_col, esr_col]:
+        for col in [probe_index_col, freq_col, temp_col, cp_col, df_col, esr_col]:
             plot_df[col] = pd.to_numeric(
                 plot_df[col], errors="coerce"
             )  # turn bad vals to NaN
 
-        plot_df = plot_df.dropna(subset=[freq_col, temp_col])  # remove unplottable rows
+        plot_df = plot_df.dropna(
+            subset=[probe_index_col, freq_col, temp_col]
+        )  # remove unplottable rows
 
         if plot_df.empty:
             self._draw_empty()
@@ -500,6 +613,9 @@ class TestDataPlot:
             cp_col,
             df_col,
             esr_col,
+            probe_index_col,
+            probe_label_col,
+            probe_color_col,
         )
 
         # temperature tab will show one frequency slice only
@@ -516,6 +632,9 @@ class TestDataPlot:
             cp_col,
             df_col,
             esr_col,
+            probe_index_col,
+            probe_label_col,
+            probe_color_col,
         )
 
     def _select_temperature_slice(self, dataframe, temp_col, selected_temp):
@@ -540,7 +659,9 @@ class TestDataPlot:
                 label = f"latest {target_temp:.2f} {CHAR_DEGC}"
 
         mask = np.isclose(dataframe[temp_col], target_temp, rtol=0, atol=0.25)
-        sliced = dataframe.loc[mask].sort_values(by="Freq. [Hz]")
+        sliced = dataframe.loc[mask].sort_values(
+            by=["Probe Index", "Freq. [Hz]"]
+        )
 
         return sliced, label
 
@@ -560,12 +681,41 @@ class TestDataPlot:
 
         label = f"{target_freq:.6g} Hz"
         mask = np.isclose(dataframe[freq_col], target_freq, rtol=1e-9, atol=1e-9)
-        sliced = dataframe.loc[mask].sort_values(by=f"Temp. [{CHAR_DEGC}]")
+        sliced = dataframe.loc[mask].sort_values(
+            by=["Probe Index", f"Temp. [{CHAR_DEGC}]"]
+        )
 
         return sliced, label
 
+    def _iter_probe_groups(
+        self, dataframe, probe_index_col, probe_label_col, probe_color_col
+    ):
+        for probe_index, probe_data in dataframe.groupby(
+            probe_index_col, sort=True
+        ):
+            labels = probe_data[probe_label_col].dropna().astype(str)
+            label = labels.iloc[0].strip() if not labels.empty else ""
+            if not label:
+                label = f"Probe {int(probe_index)}"
+
+            colors = probe_data[probe_color_col].dropna().astype(str)
+            color = colors.iloc[0].strip() if not colors.empty else ""
+            if not color:
+                color = get_default_probe_color(int(probe_index))
+
+            yield label, color, probe_data
+
     def _plot_frequency_tab(
-        self, dataframe, temp_label, freq_col, cp_col, df_col, esr_col
+        self,
+        dataframe,
+        temp_label,
+        freq_col,
+        cp_col,
+        df_col,
+        esr_col,
+        probe_index_col,
+        probe_label_col,
+        probe_color_col,
     ):
         freq_axes = self.axes["frequency"]
 
@@ -597,7 +747,31 @@ class TestDataPlot:
             ax.set_ylabel(ylabel)
             ax.grid(which="both")
 
-            if dataframe.empty:
+            plotted_count = 0
+            for label, color, probe_data in self._iter_probe_groups(
+                dataframe,
+                probe_index_col,
+                probe_label_col,
+                probe_color_col,
+            ):
+                probe_data = probe_data.dropna(subset=[freq_col, y_col]).sort_values(
+                    by=freq_col
+                )
+                if probe_data.empty:
+                    continue
+                ax.semilogx(
+                    probe_data[freq_col],
+                    probe_data[y_col],
+                    color=color,
+                    label=label,
+                    marker="o",
+                    linestyle="-",
+                )
+                plotted_count += 1
+
+            if plotted_count > 1:
+                ax.legend()
+            elif plotted_count == 0:
                 ax.text(
                     0.5,
                     0.5,
@@ -606,15 +780,20 @@ class TestDataPlot:
                     va="center",
                     transform=ax.transAxes,
                 )
-            else:
-                ax.semilogx(
-                    dataframe[freq_col], dataframe[y_col], marker="o", linestyle="-"
-                )
 
         self.canvases["frequency"].draw()
 
     def _plot_temperature_tab(
-        self, dataframe, freq_label, temp_col, cp_col, df_col, esr_col
+        self,
+        dataframe,
+        freq_label,
+        temp_col,
+        cp_col,
+        df_col,
+        esr_col,
+        probe_index_col,
+        probe_label_col,
+        probe_color_col,
     ):
         temp_axes = self.axes["temperature"]
 
@@ -646,7 +825,31 @@ class TestDataPlot:
             ax.set_ylabel(ylabel)
             ax.grid(which="both")
 
-            if dataframe.empty:
+            plotted_count = 0
+            for label, color, probe_data in self._iter_probe_groups(
+                dataframe,
+                probe_index_col,
+                probe_label_col,
+                probe_color_col,
+            ):
+                probe_data = probe_data.dropna(subset=[temp_col, y_col]).sort_values(
+                    by=temp_col
+                )
+                if probe_data.empty:
+                    continue
+                ax.plot(
+                    probe_data[temp_col],
+                    probe_data[y_col],
+                    color=color,
+                    label=label,
+                    marker="o",
+                    linestyle="-",
+                )
+                plotted_count += 1
+
+            if plotted_count > 1:
+                ax.legend()
+            elif plotted_count == 0:
                 ax.text(
                     0.5,
                     0.5,
@@ -654,10 +857,6 @@ class TestDataPlot:
                     ha="center",
                     va="center",
                     transform=ax.transAxes,
-                )
-            else:
-                ax.plot(
-                    dataframe[temp_col], dataframe[y_col], marker="o", linestyle="-"
                 )
 
         self.canvases["temperature"].draw()
@@ -702,15 +901,29 @@ class App:
         # reference for test setup
         self.temperature_setup_controls = []
         self.frequency_setup_controls = []
+        self.probe_setup_controls = []
         self.manual_command_controls = []
         self.setup_notebook = None
 
         # temp setup vars
         self.start_temp = tk.DoubleVar(value=25.0)
         self.step_temp = tk.DoubleVar(value=20.0)
+        self.use_second_step = tk.BooleanVar(value=False)
+        self.step_change_temp = tk.DoubleVar(value=100.0)
+        self.step2_temp = tk.DoubleVar(value=10.0)
         self.max_temp = tk.DoubleVar(value=125.0)
         self.dwell_time = tk.DoubleVar(value=5.0)
         self.heat_rate = tk.DoubleVar(value=5.0)
+
+        # multiprobe setup vars
+        self.enable_multiprobe = tk.BooleanVar(value=False)
+        self.number_of_probes = tk.IntVar(value=1)
+        self.probe_settling_delay = tk.DoubleVar(value=0.0)
+        self.probe_labels = {1: "Probe 1"}
+        self.probe_colors = {1: PROBE_COLOR_PALETTE[0]}
+        self.daq_task = None
+        self.daq_line_spec = DAQ_PORT0_LINE_SPEC
+        self.active_probe_index = None
 
         self.first_freq_dvar = tk.DoubleVar(value=devices.LCR_MIN_FREQ)
         self.last_freq_dvar = tk.DoubleVar(value=devices.LCR_MAX_FREQ)
@@ -726,6 +939,10 @@ class App:
         self.custom_freq_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
         self.freq_step_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
         self.test_data = pd.DataFrame(columns=TEST_DATA_COLUMNS)
+        self.probe_table_data = pd.DataFrame(
+            [(1, "Probe 1", PROBE_COLOR_PALETTE[0])],
+            columns=PROBE_TABLE_COLUMNS,
+        )
 
         self.device_strvar = tk.StringVar(value=devices.DEVICE_TYPE_LIST[0].name)
         self.message_strvar = tk.StringVar()
@@ -815,6 +1032,11 @@ class App:
             self.app_root.destroy()
 
     def close_devices_and_resources(self):
+        try:
+            self.close_daq_switching()
+        except Exception as e:
+            print(f"DAQ close error: {type(e).__name__}: {e}")
+
         for device in self.device_list:
             try:
                 if device is not None and hasattr(device, "close"):
@@ -903,15 +1125,6 @@ class App:
         )
         probes_tab.pack(side="top", fill="both", expand=True)
         notebook.add(probes_tab, text="Probes")
-        tk.Label(
-            master=probes_tab, text="Probe Selection", font=("default", 16, "bold")
-        ).pack(pady=(20, 10))
-        tk.Label(
-            master=probes_tab,
-            text="Implementation coming soon!",
-            justify="center",
-            wraplength=380,
-        ).pack()  # TODO: Add probe selection functions
         self.build_probes_tab(probes_tab)
 
     # test management tab with controls, data table, and temperature cycle plot
@@ -1043,7 +1256,7 @@ class App:
             show="headings",
             selectmode="none",
             height=16,
-            header_widths=[60, 60, 60, 60, 60, 60],
+            header_widths=[70, 80, 75, 60, 60, 60, 60, 60],
             increment=False,
         )
         self.measurement_data_table.pack(side="left", fill="both", expand=True)
@@ -1231,7 +1444,21 @@ class App:
             params, f"Start Temp [{CHAR_DEGC}]", self.start_temp
         )
         self.entry_step_temp = self._labeled_entry(
-            params, f"Step Size [{CHAR_DEGC}]", self.step_temp
+            params, f"Step Size 1 [{CHAR_DEGC}]", self.step_temp
+        )
+        self.use_second_step_checkbutton = tk.Checkbutton(
+            params,
+            text="Use second step size",
+            variable=self.use_second_step,
+            command=self.update_second_step_controls,
+            anchor="w",
+        )
+        self.use_second_step_checkbutton.pack(fill="x", pady=(6, 2))
+        self.entry_step_change_temp = self._labeled_entry(
+            params, f"Step Change Temp [{CHAR_DEGC}]", self.step_change_temp
+        )
+        self.entry_step2_temp = self._labeled_entry(
+            params, f"Step Size 2 [{CHAR_DEGC}]", self.step2_temp
         )
         self.entry_max_temp = self._labeled_entry(
             params, f"Max Temp [{CHAR_DEGC}]", self.max_temp
@@ -1255,11 +1482,19 @@ class App:
         self.temperature_setup_controls = [
             self.entry_start_temp,
             self.entry_step_temp,
+            self.use_second_step_checkbutton,
+            self.entry_step_change_temp,
+            self.entry_step2_temp,
             self.entry_max_temp,
             self.entry_dwell_time,
             self.entry_heat_rate,
             self.generate_plan_button,
         ]
+        self.second_step_controls = [
+            self.entry_step_change_temp,
+            self.entry_step2_temp,
+        ]
+        self.update_second_step_controls()
 
         table_frame = tk.LabelFrame(
             temperature_tab, text="Temperature Plan", padx=6, pady=6
@@ -1751,18 +1986,227 @@ class App:
         )
 
     def build_probes_tab(self, probes_tab):
-        # TODO: Implement this tab for BDS functionality
         self.padding(probes_tab, y=10, side="top")
         probes_labelframe = tk.LabelFrame(
             master=probes_tab,
-            text="Probes",
+            text="Multiprobe",
             font=("default", 12),
             padx=10,
             pady=10,
         )
         probes_labelframe.pack(side="top", fill="x")
 
+        self.enable_multiprobe_checkbutton = tk.Checkbutton(
+            probes_labelframe,
+            text="Enable multiprobe",
+            variable=self.enable_multiprobe,
+            command=self.sync_probe_table,
+            anchor="w",
+        )
+        self.enable_multiprobe_checkbutton.pack(fill="x", pady=(0, 4))
+
+        self.entry_number_of_probes = self._labeled_entry(
+            probes_labelframe, "Number of probes", self.number_of_probes, width=8
+        )
+        self.entry_probe_settling_delay = self._labeled_entry(
+            probes_labelframe,
+            "Settling Delay [s]",
+            self.probe_settling_delay,
+            width=8,
+        )
+
+        self.update_probe_list_button = tk.Button(
+            probes_labelframe,
+            text="Update Probe List",
+            command=self.sync_probe_table,
+            fg="royalblue",
+        )
+        self.update_probe_list_button.pack(pady=(6, 0))
+
+        self.padding(probes_tab, y=10, side="top")
+        probe_table_frame = tk.LabelFrame(
+            probes_tab, text="Probe List", padx=6, pady=6
+        )
+        probe_table_frame.pack(fill="both", expand=True)
+
+        probe_table_with_scroll_frame = tk.Frame(probe_table_frame)
+        probe_table_with_scroll_frame.pack(fill="both", expand=True)
+
+        self.probe_table = Table(
+            master=probe_table_with_scroll_frame,
+            columns=PROBE_TABLE_COLUMNS,
+            displaycolumns="#all",
+            show="headings",
+            selectmode="none",
+            height=8,
+            header_widths=[90, 180, 100],
+            increment=False,
+        )
+        self.probe_table.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(
+            master=probe_table_with_scroll_frame,
+            orient="vertical",
+            command=self.probe_table.yview,
+        )
+        scrollbar.pack(side="left", fill="y")
+        self.probe_table.configure(yscrollcommand=scrollbar.set)
+
+        self.padding(probes_tab, y=10, side="top")
+        probe_test_frame = tk.LabelFrame(
+            probes_tab, text="Manual Switch Test", padx=6, pady=6
+        )
+        probe_test_frame.pack(fill="x")
+
+        self.probe_test_buttons = []
+        for button_index, probe_index in enumerate(PROBE_SWITCH_PATTERNS):
+            button = tk.Button(
+                probe_test_frame,
+                text=f"Test Probe {probe_index}",
+                command=lambda index=probe_index: self.on_test_probe_pressed(index),
+            )
+            button.grid(
+                row=button_index // 3,
+                column=button_index % 3,
+                padx=3,
+                pady=3,
+                sticky="ew",
+            )
+            self.probe_test_buttons.append(button)
+
+        self.probe_all_off_button = tk.Button(
+            probe_test_frame,
+            text="All Off",
+            command=self.on_test_all_off_pressed,
+        )
+        self.probe_all_off_button.grid(row=1, column=1, padx=3, pady=3, sticky="ew")
+        self.probe_test_buttons.append(self.probe_all_off_button)
+        for column_index in range(3):
+            probe_test_frame.grid_columnconfigure(column_index, weight=1)
+
+        self.probe_setup_controls = [
+            self.enable_multiprobe_checkbutton,
+            self.entry_number_of_probes,
+            self.entry_probe_settling_delay,
+            self.update_probe_list_button,
+            *self.probe_test_buttons,
+        ]
+        self.sync_probe_table(show_errors=False)
+
     # DATA / MODEL METHODS -----------------------------
+
+    def update_second_step_controls(self, setup_enabled=None):
+        if setup_enabled is None:
+            setup_enabled = not self.is_sequence_active()
+        state_value = (
+            "normal" if setup_enabled and self.use_second_step.get() else "disabled"
+        )
+        for widget in getattr(self, "second_step_controls", []):
+            try:
+                widget.config(state=state_value)
+            except Exception:
+                pass
+
+    def get_probe_count(self):
+        try:
+            count = int(self.number_of_probes.get())
+        except (ValueError, TypeError, tk.TclError):
+            return 1
+        return max(1, count)
+
+    def get_probe_settling_delay(self):
+        try:
+            delay = float(self.probe_settling_delay.get())
+        except (ValueError, TypeError, tk.TclError):
+            return 0.0
+        return max(0.0, delay)
+
+    def get_probe_color(self, probe_index):
+        if probe_index not in self.probe_colors:
+            self.probe_colors[probe_index] = get_default_probe_color(probe_index)
+        return self.probe_colors[probe_index]
+
+    def get_probe_configs(self):
+        count = self.get_probe_count() if self.enable_multiprobe.get() else 1
+        configs = []
+        for probe_index in range(1, count + 1):
+            label = self.probe_labels.get(probe_index, f"Probe {probe_index}")
+            color = self.get_probe_color(probe_index)
+            configs.append((probe_index, label, color))
+        return configs
+
+    def validate_probe_settings(self):
+        if not self.enable_multiprobe.get():
+            return
+        try:
+            count = int(self.number_of_probes.get())
+        except (ValueError, TypeError, tk.TclError):
+            raise ValueError("Number of probes must be an integer.")
+        if count < 1:
+            raise ValueError("Number of probes must be at least 1.")
+        if count > len(PROBE_SWITCH_PATTERNS):
+            raise ValueError(
+                f"Only {len(PROBE_SWITCH_PATTERNS)} probes are currently mapped "
+                "for USB-6501 switching."
+            )
+        try:
+            delay = float(self.probe_settling_delay.get())
+        except (ValueError, TypeError, tk.TclError):
+            raise ValueError("Probe settling delay must be numeric.")
+        if delay < 0:
+            raise ValueError("Probe settling delay cannot be negative.")
+
+    def sync_probe_table(self, show_errors=True):
+        try:
+            self.validate_probe_settings()
+        except ValueError as e:
+            if show_errors:
+                messagebox.showerror("Invalid Probe Settings", str(e))
+            return False
+
+        self.probe_table_data = pd.DataFrame(
+            self.get_probe_configs(), columns=PROBE_TABLE_COLUMNS
+        )
+        if hasattr(self, "probe_table"):
+            self.probe_table.update_table(self.probe_table_data)
+        return True
+
+    def on_test_probe_pressed(self, probe_index):
+        if self.is_sequence_active():
+            messagebox.showwarning(
+                "Sequence Active",
+                "Manual probe switching is disabled while a sequence is active.",
+            )
+            return
+        if not self.enable_multiprobe.get():
+            messagebox.showwarning(
+                "Multiprobe Disabled",
+                "Enable multiprobe before using the manual probe test buttons.",
+            )
+            return
+        try:
+            self.validate_probe_settings()
+            if probe_index > self.get_probe_count():
+                messagebox.showwarning(
+                    "Probe Not Enabled",
+                    f"Probe {probe_index} is not enabled. "
+                    "Increase Number of probes first.",
+                )
+                return
+            self.switch_to_probe(probe_index, self.get_probe_configs())
+        except Exception as e:
+            messagebox.showerror(
+                "Probe Switch Error", f"{type(e).__name__}: {e}"
+            )
+
+    def on_test_all_off_pressed(self):
+        if self.is_sequence_active():
+            messagebox.showwarning(
+                "Sequence Active",
+                "Manual probe switching is disabled while a sequence is active.",
+            )
+            return
+        self.switch_all_probes_off(initialize_if_needed=True)
 
     # helper function utilizing the build_temperature_plan function to generate the temperature plan dataframe based on the current input parameters
     def generate_temperature_plan(self):
@@ -1771,7 +2215,7 @@ class App:
                 "Sequence Active",
                 "Temperature plan cannot be edited while a sequence is active.",
             )
-            return
+            return False
         try:
             self.temp_step_data = build_temperature_plan(
                 self.start_temp.get(),
@@ -1779,6 +2223,9 @@ class App:
                 self.max_temp.get(),
                 self.dwell_time.get(),
                 self.heat_rate.get(),
+                self.use_second_step.get(),
+                self.step_change_temp.get(),
+                self.step2_temp.get(),
             )
 
             self.temp_step_table.update_table(self.temp_step_data)
@@ -1786,9 +2233,11 @@ class App:
                 self.temp_step_data,
                 start_temp=self.start_temp.get(),
             )
+            return True
 
-        except ValueError as e:
+        except (ValueError, tk.TclError) as e:
             messagebox.showerror("Invalid Temperature Plan", str(e))
+            return False
 
     # sync function to update temp step table and plot with new temperature plan data
     def sync_temp_step(self, dataframe: pd.DataFrame, *args):
@@ -1903,6 +2352,17 @@ class App:
         self.last_temperature_readings_length = 0
 
         self.sync_measurement_data()
+
+    def reset_temperature_log_and_chart(self):
+        with self.temperature_table_lock:
+            self.temperature_readings_table = pd.DataFrame(
+                columns=TEMPERATURE_READINGS_COLUMNS
+            )
+            self.temperature_rolling_table = pd.DataFrame(
+                columns=TEMPERATURE_READINGS_COLUMNS
+            )
+        self.last_temperature_readings_length = 0
+        self.reset_temperature_chart()
 
     # reset test setup
     def reset_test_setup(self):
@@ -2054,6 +2514,7 @@ class App:
         try:
             freq_col = "Freq. [Hz]"
             temp_col = f"Temp. [{CHAR_DEGC}]"
+            probe_index_col = "Probe Index"
             cp_col = "Cp [F]"
             df_col = "Df [1]"
             esr_col = f"ESR [{CHAR_OHM}]"
@@ -2063,13 +2524,23 @@ class App:
             measurements = self.test_data.copy()
 
             if not measurements.empty:
-                for col in [freq_col, temp_col, cp_col, df_col, esr_col]:
+                for col in [
+                    probe_index_col,
+                    freq_col,
+                    temp_col,
+                    cp_col,
+                    df_col,
+                    esr_col,
+                ]:
                     if col in measurements.columns:
                         measurements[col] = pd.to_numeric(
                             measurements[col], errors="coerce"
                         )
+                sort_columns = [temp_col, freq_col]
+                if probe_index_col in measurements.columns:
+                    sort_columns = [temp_col, probe_index_col, freq_col]
                 measurements = measurements.sort_values(
-                    by=[temp_col, freq_col],
+                    by=sort_columns,
                     ignore_index=True,
                 )
             # metadata
@@ -2078,10 +2549,13 @@ class App:
                     ["Export Time", datetime.now().isoformat(timespec="seconds")],
                     ["Output Path", filepath],
                     ["Start Temp [C]", self.start_temp.get()],
-                    ["Step Temp [C]", self.step_temp.get()],
+                    ["Step Temp 1 [C]", self.step_temp.get()],
+                    ["Use Second Step", self.use_second_step.get()],
+                    ["Step Change Temp [C]", self.step_change_temp.get()],
+                    ["Step Temp 2 [C]", self.step2_temp.get()],
                     ["Max Temp [C]", self.max_temp.get()],
                     ["Dwell Time [min]", self.dwell_time.get()],
-                    ["Heat Rate [C/min]", self.heat_rate.get()],
+                    ["Heat Ramp [C/min]", self.heat_rate.get()],
                     [
                         "Selected Plot Frequency [Hz]",
                         self.get_selected_plot_frequency(),
@@ -2162,7 +2636,11 @@ class App:
 
                     temp_export_df = (
                         temp_df.drop(columns=["_Export Temp Group [C]"])
-                        .sort_values(by=freq_col)
+                        .sort_values(
+                            by=[probe_index_col, freq_col]
+                            if probe_index_col in temp_df.columns
+                            else freq_col
+                        )
                         .reset_index(drop=True)
                     )
 
@@ -2269,6 +2747,9 @@ class App:
             dwell_time=self.dwell_time.get(),
             heat_rate=self.heat_rate.get(),
             focus_freq=DEFAULT_FOCUS_FREQ_HZ,
+            enable_multiprobe=self.enable_multiprobe.get(),
+            probe_configs=tuple(self.get_probe_configs()),
+            probe_settling_delay=self.get_probe_settling_delay(),
         )
 
     # get the full frequency list from the tables
@@ -2370,7 +2851,10 @@ class App:
         read_after_write=False,
     ):
         code, reply = self.device_msg(
-            device=device, query=query, hused=True, read_after_write=read_after_write
+            device=device,
+            query=query,
+            hushed=True,
+            read_after_write=read_after_write,
         )
 
         if code < 0:
@@ -2538,6 +3022,142 @@ class App:
 
         return cp, df, esr
 
+    @staticmethod
+    def probe_pattern_to_bits(pattern: int):
+        if not isinstance(pattern, int) or isinstance(pattern, bool):
+            raise ValueError("Probe switch pattern must be an integer.")
+        if pattern < 0 or pattern > 0xFF:
+            raise ValueError("Probe switch pattern must be between 0 and 255.")
+        return [bool(pattern & (1 << bit_index)) for bit_index in range(8)]
+
+    def get_daq_line_spec(self):
+        daq = self.get_device_by_type(devices.NIDAQ_USB6501)
+        if daq is not None and getattr(daq, "address", None):
+            return f"{daq.address}/port0/line0:7"
+        return self.daq_line_spec
+
+    def initialize_daq_switching(self):
+        if self.daq_task is not None:
+            return self.daq_task
+        if nidaqmx is None or LineGrouping is None:
+            detail = (
+                f" Import error: {NIDAQMX_IMPORT_ERROR}"
+                if NIDAQMX_IMPORT_ERROR is not None
+                else ""
+            )
+            raise RuntimeError(
+                "NI-DAQmx Python support is unavailable. Install NI-DAQmx and "
+                f"the nidaqmx package before enabling multiprobe switching.{detail}"
+            )
+
+        task = None
+        line_spec = self.get_daq_line_spec()
+        try:
+            task = nidaqmx.Task()
+            task.do_channels.add_do_chan(
+                line_spec,
+                line_grouping=LineGrouping.CHAN_PER_LINE,
+            )
+            self.daq_task = task
+            self.write_probe_pattern(
+                PROBE_ALL_OFF_PATTERN, reason="DAQ initialization"
+            )
+            print(f"USB-6501 output task initialized on {line_spec}")
+            return self.daq_task
+        except Exception as e:
+            self.daq_task = None
+            if task is not None:
+                try:
+                    task.close()
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"Could not initialize USB-6501 output task on "
+                f"{line_spec}: {type(e).__name__}: {e}"
+            ) from e
+
+    def write_probe_pattern(self, pattern: int, reason: str = ""):
+        bits = self.probe_pattern_to_bits(pattern)
+        if self.daq_task is None:
+            self.initialize_daq_switching()
+
+        reason_text = f" ({reason})" if reason else ""
+        try:
+            self.daq_task.write(bits, auto_start=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"USB-6501 write failed for pattern {pattern:08b} "
+                f"(decimal {pattern}){reason_text}: {type(e).__name__}: {e}"
+            ) from e
+
+        print(
+            f"USB-6501 write{reason_text}: pattern {pattern:08b}, "
+            f"decimal {pattern}, bits P0.0-P0.7={bits}"
+        )
+        return True
+
+    def switch_all_probes_off(self, initialize_if_needed=False):
+        self.active_probe_index = None
+
+        if self.daq_task is None:
+            if not initialize_if_needed:
+                return True
+            try:
+                self.initialize_daq_switching()
+            except Exception as e:
+                print(f"Could not switch all probes off: {type(e).__name__}: {e}")
+                return False
+
+        try:
+            self.write_probe_pattern(
+                PROBE_ALL_OFF_PATTERN, reason="all probes off"
+            )
+            return True
+        except Exception as e:
+            print(f"Could not switch all probes off: {type(e).__name__}: {e}")
+            return False
+
+    def close_daq_switching(self):
+        task = self.daq_task
+        if task is None:
+            self.active_probe_index = None
+            return
+
+        self.switch_all_probes_off()
+        try:
+            task.close()
+        finally:
+            self.daq_task = None
+            self.active_probe_index = None
+
+    def switch_to_probe(self, probe_index: int, probe_configs=None):
+        configs = tuple(probe_configs) if probe_configs is not None else tuple(
+            self.get_probe_configs()
+        )
+        labels_by_index = {config[0]: config[1] for config in configs}
+        if probe_index not in labels_by_index:
+            raise ValueError(f"Invalid probe index: {probe_index}")
+        if probe_index not in PROBE_SWITCH_PATTERNS:
+            raise ValueError(
+                f"Probe {probe_index} does not have a mapped USB-6501 pattern."
+            )
+
+        pattern = PROBE_SWITCH_PATTERNS[probe_index]
+        self.initialize_daq_switching()
+        self.write_probe_pattern(
+            PROBE_ALL_OFF_PATTERN,
+            reason=f"break before selecting probe {probe_index}",
+        )
+        self.active_probe_index = None
+        time.sleep(PROBE_BREAK_BEFORE_MAKE_SECONDS)
+        self.write_probe_pattern(pattern, reason=f"select probe {probe_index}")
+        self.active_probe_index = probe_index
+        print(
+            f"Selected probe {probe_index} ({labels_by_index[probe_index]}): "
+            f"pattern {pattern:08b}, decimal {pattern}"
+        )
+        return True
+
     def is_sequence_active(self):
         return bool(self.state & RUN_STATE.RUNNING) or self.state in (
             RUN_STATE.PROGRAMMING,
@@ -2555,8 +3175,10 @@ class App:
     def set_setup_controls_enabled(self, enabled: bool):
         self.set_widgets_enabled(self.temperature_setup_controls, enabled)
         self.set_widgets_enabled(self.frequency_setup_controls, enabled)
+        self.set_widgets_enabled(self.probe_setup_controls, enabled)
+        self.update_second_step_controls(setup_enabled=enabled)
         if self.setup_notebook is not None:
-            for index in (0, 1):
+            for index in (0, 1, 3):
                 try:
                     self.setup_notebook.tab(
                         index, state="normal" if enabled else "disabled"
@@ -2645,9 +3267,11 @@ class App:
                 "Sequence Active", "Cannot program while a sequence is active."
             )
             return
-        self.generate_temperature_plan()
+        if not self.generate_temperature_plan():
+            return
         if self.temp_step_data.empty:
             return
+        self.reset_temperature_log_and_chart()
         cfg = self.get_run_data()
         self.state = RUN_STATE.PROGRAMMING
         self.set_controls_programming()
@@ -2670,6 +3294,12 @@ class App:
         if self.run_thread is not None and self.run_thread.is_alive():
             messagebox.showwarning("Run Active", "A run is already active.")
             return
+        try:
+            self.validate_probe_settings()
+        except ValueError as e:
+            messagebox.showerror("Invalid Probe Settings", str(e))
+            return
+        self.sync_probe_table(show_errors=False)
         cfg = self.get_run_data()
         freqs = self.get_frequency_list()
         try:
@@ -2734,6 +3364,8 @@ class App:
             self.device_msg(device=oven, query="COFF")
             self.device_msg(device=oven, query="HOFF")
 
+        self.switch_all_probes_off()
+
         if self.run_thread is None or not self.run_thread.is_alive():
             self.set_controls_idle()
 
@@ -2769,6 +3401,10 @@ class App:
         # devices
         oven = self.get_device_by_type(devices.SunSystemsOven_EC1A)
         lcr = self.get_device_by_type(devices.KeysightLCR_E4980A)
+        if cfg.enable_multiprobe:
+            self.switch_all_probes_off(initialize_if_needed=True)
+        else:
+            self.switch_all_probes_off(initialize_if_needed=False)
 
         # check devices
         if all(device is None for device in self.device_list):
@@ -2882,34 +3518,52 @@ class App:
                     f"User Stable = {user_stable}"
                 )
 
-                self.state = RUN_STATE.LCR_MEASURING
                 if self.stop_requested:
                     break
-                for freq in freqs:
+                for probe_index, probe_label, probe_color in cfg.probe_configs:
                     if self.stop_requested:
-                        print("Stop requested during LCR sweep.")
                         break
                     while self.pause_requested and not self.stop_requested:
                         time.sleep(0.5)
                     if self.stop_requested:
-                        print("Stop requested before LCR measurement.")
                         break
-                    try:
-                        cp, df, esr = self.measure_lcr_at_freq(lcr, freq)
-                    except Exception as e:
-                        print(
-                            f"LCR measurement failed at step {step_num}, "
-                            f"frequency {freq:g} Hz: {type(e).__name__}: {e}"
-                        )
-                        cp, df, esr = np.nan, np.nan, np.nan
-                    self.test_data.loc[len(self.test_data)] = [
-                        1,
-                        user_temp,
-                        freq,
-                        cp,
-                        df,
-                        esr,
-                    ]
+
+                    if cfg.enable_multiprobe:
+                        self.state = RUN_STATE.PROBE_SWITCHING
+                        self.switch_to_probe(probe_index, cfg.probe_configs)
+                        settle_until = time.time() + cfg.probe_settling_delay
+                        while time.time() < settle_until and not self.stop_requested:
+                            time.sleep(min(0.5, settle_until - time.time()))
+
+                    self.state = RUN_STATE.LCR_MEASURING
+                    for freq in freqs:
+                        if self.stop_requested:
+                            print("Stop requested during LCR sweep.")
+                            break
+                        while self.pause_requested and not self.stop_requested:
+                            time.sleep(0.5)
+                        if self.stop_requested:
+                            print("Stop requested before LCR measurement.")
+                            break
+                        try:
+                            cp, df, esr = self.measure_lcr_at_freq(lcr, freq)
+                        except Exception as e:
+                            print(
+                                f"LCR measurement failed at step {step_num}, "
+                                f"probe {probe_index}, frequency {freq:g} Hz: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            cp, df, esr = np.nan, np.nan, np.nan
+                        self.test_data.loc[len(self.test_data)] = [
+                            probe_index,
+                            probe_label,
+                            probe_color,
+                            user_temp,
+                            freq,
+                            cp,
+                            df,
+                            esr,
+                        ]
 
                 self.app_root.after(0, self.sync_measurement_data)
 
@@ -2920,6 +3574,7 @@ class App:
                     return
 
                 self.device_msg(device=oven, query="BKPNTC")
+            self.switch_all_probes_off()
             print("Run complete!")
             self.state = RUN_STATE.DONE
             self.app_root.after(0, self.set_controls_idle)
@@ -2928,6 +3583,7 @@ class App:
             print(f"Run Failed: {e}")
             self.pause_requested = False
             self.stop_requested = False
+            self.switch_all_probes_off()
             if oven is not None:
                 self.device_msg(device=oven, query="STOP", hushed=True)
                 self.device_msg(device=oven, query="COFF", hushed=True)
