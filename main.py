@@ -1,4 +1,5 @@
-# HT-BDS: Hub-Temperature-Controlled BDS Testing Software
+# HT-BDS: High Temperature Broadband Dielectric Spectroscopy
+# An automated test system for measuring dielectric properties of materials at high temperatures and broadband frequencies.
 # Author: Matthew Wang
 
 # ===============================================================================
@@ -920,6 +921,12 @@ class App:
         self.number_of_probes = tk.IntVar(value=1)
         self.probe_settling_delay = tk.DoubleVar(value=0.0)
         self.probe_labels = {1: "Probe 1"}
+        self.probe_name_vars = {
+            1: tk.StringVar(value="Probe 1"),
+            2: tk.StringVar(value="Probe 2"),
+            3: tk.StringVar(value="Probe 3"),
+            4: tk.StringVar(value="Probe 4"),
+        }
         self.probe_colors = {1: PROBE_COLOR_PALETTE[0]}
         self.daq_task = None
         self.daq_line_spec = DAQ_PORT0_LINE_SPEC
@@ -1921,10 +1928,6 @@ class App:
             pady=10,
         )
         message_labelframe.pack(side="top", fill="x")
-        # message_label = tk.Label(
-        #     master=message_labelframe,
-        #     text="CMD: ",
-        # ); message_label.pack(side='left')
         self.manual_message_entry = Entry(
             master=message_labelframe,
             justify="left",
@@ -2008,6 +2011,16 @@ class App:
         self.entry_number_of_probes = self._labeled_entry(
             probes_labelframe, "Number of probes", self.number_of_probes, width=8
         )
+
+        self.probe_name_entries = {}
+        for probe_index in range(1, 5):
+            self.probe_name_entries[probe_index] = self._labeled_entry(
+                probes_labelframe,
+                f"Probe {probe_index} Name",
+                self.probe_name_vars[probe_index],
+                width=12,
+            )
+
         self.entry_probe_settling_delay = self._labeled_entry(
             probes_labelframe,
             "Settling Delay [s]",
@@ -2130,7 +2143,9 @@ class App:
         count = self.get_probe_count() if self.enable_multiprobe.get() else 1
         configs = []
         for probe_index in range(1, count + 1):
-            label = self.probe_labels.get(probe_index, f"Probe {probe_index}")
+            label = self.probe_name_vars[probe_index].get().strip()
+            if not label:
+                label = f"Probe {probe_index}"
             color = self.get_probe_color(probe_index)
             configs.append((probe_index, label, color))
         return configs
@@ -2843,6 +2858,7 @@ class App:
     def show_error_threadsafe(self, title: str, message: str):
         self.app_root.after(0, lambda: messagebox.showerror(title, message))
 
+    # TODO: implement for robustness
     def checked_device_msg(
         self,
         device,
@@ -2891,7 +2907,7 @@ class App:
         self.device_msg(device=oven, query="STORE#0")
 
         self.device_msg(device=oven, query="HON")
-        self.device_msg(device=oven, query="SINT=NNNNNNYNNY0")
+        self.device_msg(device=oven, query="SINT=NNNNNNYNNY0")  # interrupt configuration
 
         for _, row in self.temp_step_data.iterrows():
             step_num = int(row[TEMP_PLAN_COLUMNS[0]])
