@@ -52,6 +52,8 @@ this lets you check `if state & RUN_STATE.RUNNING` instead of comparing against 
 **live plots** — two tabbed plot views update during the run: measurements vs frequency (Cp, Df, ESR on semilog x-axis) and vs temperature (at a user-selectable focus frequency). a plot filter bar lets you pick which temperature step's frequency data to display and which frequency to track in the temperature view. a third live plot in the test management panel shows rolling oven readings (set, chamber, user) updating every second.
  
 **device abstraction** — `devices.py` defines a `Device` base class with `send()` and `wait_interrupt()` interface methods. `KeysightLCR_E4980A`, `SunSystemsOven_EC1A`, and `NIDAQ_USB6501` each implement the appropriate communication layer. `send()` in `devices.py` handles query vs. command routing — anything ending in `?` goes through `dev.query()`, everything else through `dev.write()`, with an optional `read_after_write` flag for commands that return a response without a `?`.
+
+**Example Excel Workbook** - https://1drv.ms/x/c/96da2fc03f155a85/IQD4mGVcUPogSJevcF02TeFoAbbEdrL4u7J5OcH7CsNuQRE?e=ee4Sc5
  
 ---
  
