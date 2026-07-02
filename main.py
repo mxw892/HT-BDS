@@ -1,5 +1,4 @@
-# HT-BDS: High Temperature Broadband Dielectric Spectroscopy
-# An automated test system for measuring dielectric properties of materials at high temperatures and broadband frequencies.
+# HT-BDS: Hub-Temperature-Controlled BDS Testing Software
 # Author: Matthew Wang
 
 # ===============================================================================
@@ -26,8 +25,8 @@ import threading
 from datetime import datetime
 
 try:
-    import nidaqmx
-    from nidaqmx.constants import LineGrouping
+    import nidaqmx # type: ignore
+    from nidaqmx.constants import LineGrouping  # type: ignore
 except Exception as e:
     nidaqmx = None
     LineGrouping = None
@@ -107,6 +106,20 @@ TEMP_PLAN_COLUMNS = (
 # display constants
 DEFAULT_FOCUS_FREQ_HZ = 1000.0
 MEASUREMENT_DISPLAY_ROWS = 50
+DEFAULT_ROLL_ID = os.environ.get("HTBDS_ROLL_ID", "")
+DEFAULT_OPERATOR = os.environ.get("HTBDS_OPERATOR") or os.environ.get(
+    "USERNAME", os.environ.get("USER", "")
+)
+BUTTON_COLORS = {
+    "primary": ("#d9e8f5", "#c4dcef", "#153a54"),
+    "success": ("#cfead6", "#b8dfc3", "#173f25"),
+    "warning": ("#fff0bd", "#f5df94", "#4c3b05"),
+    "danger": ("#f3c7c2", "#ebb0aa", "#5d1f19"),
+    "pause": ("#e3d7f4", "#d3c2ec", "#3a285c"),
+    "clear": ("#f8d7bd", "#efc6a4", "#5a2b0d"),
+    "export": ("#cfeee6", "#b8e2d7", "#123f34"),
+    "neutral": ("#e8edf3", "#d5dde7", "#243244"),
+}
 PROBE_COLOR_PALETTE = (
     "#1f77b4",
     "#ff7f0e",
@@ -941,6 +954,9 @@ class App:
         self.selected_plot_freq_strvar = tk.StringVar(
             value=f"{DEFAULT_FOCUS_FREQ_HZ:.6G}"
         )
+        self.roll_id_strvar = tk.StringVar(value=DEFAULT_ROLL_ID)
+        self.operator_strvar = tk.StringVar(value=DEFAULT_OPERATOR)
+        self.traceability_confirmed = bool(DEFAULT_ROLL_ID and DEFAULT_OPERATOR)
 
         self.temp_step_data = pd.DataFrame(columns=TEMP_PLAN_COLUMNS)
         self.custom_freq_data = pd.DataFrame(columns=FREQ_STEP_COLUMNS[1:])
@@ -1019,6 +1035,7 @@ class App:
         self.build_test_setup(left)
         self.build_test_management(middle)
         self.build_data_plots(right)
+        self.style_buttons(self.app_root)
         return self.app_root
 
     # function for confirmation before closing
@@ -1069,6 +1086,108 @@ class App:
         entry = Entry(row, textvariable=variable, width=width, justify="right")
         entry.pack(side="left")
         return entry
+
+    def _button_variant_for_text(self, text: str):
+        text = text.lower()
+        if "stop" in text or "all off" in text:
+            return "danger"
+        if "clear" in text or "remove" in text:
+            return "clear"
+        if text in ("run", "running"):
+            return "success"
+        if "pause" in text or "resume" in text:
+            return "pause"
+        if "export" in text:
+            return "export"
+        if "program" in text or "generate" in text or text == "set":
+            return "warning"
+        if "new" in text or "refresh" in text or "update" in text or "send" in text:
+            return "primary"
+        if "add" in text:
+            return "success"
+        return "neutral"
+
+    def configure_pastel_button(self, button: tk.Button, variant: str | None = None):
+        variant = variant or self._button_variant_for_text(str(button.cget("text")))
+        bg, activebackground, fg = BUTTON_COLORS.get(
+            variant, BUTTON_COLORS["neutral"]
+        )
+        button.configure(
+            bg=bg,
+            activebackground=activebackground,
+            fg=fg,
+            activeforeground=fg,
+            disabledforeground="#7f8790",
+            relief="raised",
+            bd=2,
+            padx=7,
+            pady=3,
+            wraplength=105,
+            justify="center",
+            overrelief="ridge",
+        )
+
+    def style_buttons(self, widget):
+        if widget.__class__.__name__ == "NavigationToolbar2Tk" or hasattr(
+            widget, "toolitems"
+        ):
+            return
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Button):
+                self.configure_pastel_button(child)
+            self.style_buttons(child)
+
+    def make_action_button(self, master, text, command, variant=None, **kwargs):
+        button = tk.Button(
+            master=master,
+            text=text,
+            command=command,
+            font=("default", 9, "bold"),
+            height=1,
+            **kwargs,
+        )
+        self.configure_pastel_button(button, variant=variant)
+        return button
+
+    def arrange_management_buttons(self, event=None):
+        if not hasattr(self, "management_buttons"):
+            return
+
+        width = (
+            event.width
+            if event is not None
+            else self.management_button_box.winfo_width()
+        )
+        if width < 260:
+            columns = 1
+        elif width < 380:
+            columns = 2
+        else:
+            columns = 4
+
+        if columns == getattr(self, "management_button_columns", None):
+            return
+        self.management_button_columns = columns
+
+        for button in self.management_buttons:
+            button.grid_forget()
+        for column in range(4):
+            self.management_button_box.grid_columnconfigure(
+                column, weight=0, minsize=0
+            )
+        for column in range(columns):
+            self.management_button_box.grid_columnconfigure(
+                column, weight=1, minsize=86
+            )
+
+        for index, button in enumerate(self.management_buttons):
+            button.grid(
+                row=index // columns,
+                column=index % columns,
+                padx=4,
+                pady=3,
+                sticky="ew",
+            )
 
     # MENUBAR ---------------------------
     # menubar with file options
@@ -1140,104 +1259,65 @@ class App:
             master,
             text="Controls",
             font=("default", 12),
-            padx=10,
-            pady=10,
+            padx=6,
+            pady=6,
         )
         controls_labelframe.pack(side="top", fill="x")
         button_box = tk.Frame(
             master=controls_labelframe,
-            padx=8,
-            pady=8,
+            padx=4,
+            pady=4,
             bg="#E8E8E8",
         )
         button_box.pack(side="top", fill="x")
 
-        for col in range(4):
-            button_box.grid_columnconfigure(col, weight=1, uniform="controls")
+        self.management_button_box = button_box
+        self.management_button_columns = None
 
-        button_width = 9
-        button_padx = 4
-        button_pady = 4
-
-        self.program_button = tk.Button(
-            master=button_box,
-            text="Program",
-            command=self.on_program_pressed,
-            font=("default", 10, "bold"),
-            width=button_width,
+        self.program_button = self.make_action_button(
+            button_box, "Program", self.on_program_pressed, variant="warning"
         )
-        self.program_button.grid(
-            row=0, column=0, padx=button_padx, pady=button_pady, sticky="ew"
-        )
-
-        self.run_button = tk.Button(
-            master=button_box,
-            text="Run",
-            command=self.on_run_pressed,
-            font=("default", 10, "bold"),
-            width=button_width,
+        self.run_button = self.make_action_button(
+            button_box,
+            "Run",
+            self.on_run_pressed,
+            variant="success",
             state="disabled",
         )
-        self.run_button.grid(
-            row=0, column=1, padx=button_padx, pady=button_pady, sticky="ew"
-        )
-
-        self.pause_button = tk.Button(
-            master=button_box,
-            text="Pause",
-            command=self.on_pause_pressed,
-            font=("default", 10, "bold"),
-            width=button_width,
+        self.pause_button = self.make_action_button(
+            button_box,
+            "Pause",
+            self.on_pause_pressed,
+            variant="pause",
             state="disabled",
         )
-        self.pause_button.grid(
-            row=0, column=2, padx=button_padx, pady=button_pady, sticky="ew"
-        )
-
-        self.stop_button = tk.Button(
-            master=button_box,
-            text="Stop",
-            command=self.on_stop_pressed,
-            font=("default", 10, "bold"),
-            width=button_width,
+        self.stop_button = self.make_action_button(
+            button_box,
+            "Stop",
+            self.on_stop_pressed,
+            variant="danger",
             state="disabled",
         )
-        self.stop_button.grid(
-            row=0, column=3, padx=button_padx, pady=button_pady, sticky="ew"
+        self.new_run_button = self.make_action_button(
+            button_box, "New Run", self.on_new_run_pressed, variant="primary"
         )
-
-        self.new_run_button = tk.Button(
-            master=button_box,
-            text="New Run",
-            command=self.on_new_run_pressed,
-            font=("default", 10, "bold"),
-            width=button_width,
+        self.clear_data_button = self.make_action_button(
+            button_box, "Clear Data", self.on_clear_data_pressed, variant="clear"
         )
-        self.new_run_button.grid(
-            row=1, column=0, padx=button_padx, pady=button_pady, sticky="ew"
+        self.export_button = self.make_action_button(
+            button_box, "Export", self.export_results, variant="export"
         )
-
-        self.clear_data_button = tk.Button(
-            master=button_box,
-            text="Clear Data",
-            command=self.on_clear_data_pressed,
-            font=("default", 10, "bold"),
-            width=button_width,
+        self.management_buttons = (
+            self.program_button,
+            self.run_button,
+            self.pause_button,
+            self.stop_button,
+            self.new_run_button,
+            self.clear_data_button,
+            self.export_button,
         )
-        self.clear_data_button.grid(
-            row=1, column=1, padx=button_padx, pady=button_pady, sticky="ew"
-        )
-
-        self.export_button = tk.Button(
-            master=button_box,
-            text="Export",
-            command=self.export_results,
-            font=("default", 10, "bold"),
-            width=button_width,
-        )
-        self.export_button.grid(
-            row=1, column=2, padx=button_padx, pady=button_pady, sticky="ew"
-        )
+        button_box.bind("<Configure>", self.arrange_management_buttons)
+        self.app_root.after(0, self.arrange_management_buttons)
 
         self.padding(master, y=10, side="top")
 
@@ -2298,6 +2378,81 @@ class App:
             value = "Latest"
         return value or "Latest"
 
+    def get_traceability_values(self) -> tuple[str, str]:
+        return self.roll_id_strvar.get().strip(), self.operator_strvar.get().strip()
+
+    def ensure_traceability_metadata(self) -> bool:
+        roll_id, operator_name = self.get_traceability_values()
+        if self.traceability_confirmed and roll_id and operator_name:
+            return True
+        return self.prompt_traceability_metadata()
+
+    def prompt_traceability_metadata(self) -> bool:
+        result = {"confirmed": False}
+        dialog = tk.Toplevel(self.app_root)
+        dialog.title("Run Traceability")
+        dialog.transient(self.app_root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        roll_id_var = tk.StringVar(value=self.roll_id_strvar.get())
+        operator_var = tk.StringVar(value=self.operator_strvar.get())
+
+        body = ttk.Frame(dialog, padding=12)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Roll ID").grid(row=0, column=0, sticky="w", pady=4)
+        roll_entry = Entry(body, textvariable=roll_id_var, width=30)
+        roll_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        ttk.Label(body, text="Operator").grid(row=1, column=0, sticky="w", pady=4)
+        operator_entry = Entry(body, textvariable=operator_var, width=30)
+        operator_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        button_frame = ttk.Frame(body)
+        button_frame.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def accept():
+            roll_id = roll_id_var.get().strip()
+            operator_name = operator_var.get().strip()
+            if not roll_id or not operator_name:
+                messagebox.showwarning(
+                    "Required Fields",
+                    "Roll ID and Operator are required.",
+                    parent=dialog,
+                )
+                if not roll_id:
+                    roll_entry.focus_set()
+                else:
+                    operator_entry.focus_set()
+                return
+
+            self.roll_id_strvar.set(roll_id)
+            self.operator_strvar.set(operator_name)
+            self.traceability_confirmed = True
+            result["confirmed"] = True
+            dialog.destroy()
+
+        def cancel():
+            result["confirmed"] = False
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="Cancel", command=cancel).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(button_frame, text="OK", command=accept).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Return>", lambda *_: accept())
+        dialog.bind("<Escape>", lambda *_: cancel())
+
+        if not roll_id_var.get().strip():
+            roll_entry.focus_set()
+        else:
+            operator_entry.focus_set()
+        self.app_root.wait_window(dialog)
+        return result["confirmed"]
+
     # updates the dropdown options
     def update_plot_filter_options(self):
         if self.test_data.empty:
@@ -2447,6 +2602,9 @@ class App:
         self.reset_test_setup()
         self.reset_temperature_chart()
         self.reset_measurement_data()
+        self.roll_id_strvar.set(DEFAULT_ROLL_ID)
+        self.operator_strvar.set(DEFAULT_OPERATOR)
+        self.traceability_confirmed = bool(DEFAULT_ROLL_ID and DEFAULT_OPERATOR)
         self.set_controls_idle()
 
     # name error checking
@@ -2512,6 +2670,9 @@ class App:
             )
             return
 
+        if not self.ensure_traceability_metadata():
+            return
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = f"HT-BDS_{timestamp}.xlsx"
 
@@ -2537,6 +2698,7 @@ class App:
             freq_plan = pd.DataFrame({"Frequency [Hz]": self.get_frequency_list()})
             temp_log = self.get_temperature_log()
             measurements = self.test_data.copy()
+            roll_id, operator_name = self.get_traceability_values()
 
             if not measurements.empty:
                 for col in [
@@ -2563,6 +2725,8 @@ class App:
                 [
                     ["Export Time", datetime.now().isoformat(timespec="seconds")],
                     ["Output Path", filepath],
+                    ["Roll ID", roll_id],
+                    ["Operator", operator_name],
                     ["Start Temp [C]", self.start_temp.get()],
                     ["Step Temp 1 [C]", self.step_temp.get()],
                     ["Use Second Step", self.use_second_step.get()],
@@ -3309,6 +3473,8 @@ class App:
     def on_run_pressed(self):
         if self.run_thread is not None and self.run_thread.is_alive():
             messagebox.showwarning("Run Active", "A run is already active.")
+            return
+        if not self.ensure_traceability_metadata():
             return
         try:
             self.validate_probe_settings()
