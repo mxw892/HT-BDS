@@ -1,4 +1,4 @@
-# HT-BDS: Hub-Temperature-Controlled BDS Testing Software
+# HT-BDS: High-Temperature-Controlled BDS Testing Software
 # Author: Matthew Wang
 
 # ===============================================================================

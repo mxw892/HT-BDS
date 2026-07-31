@@ -111,7 +111,7 @@ def send(dev, cmd: str = "", read_after_write: bool = False):
 class Device:
     name: str
     address: str
-    device: Resource | nidaqsys.Device
+    device: Resource | nidaqsys.Device  #type: ignore
 
     def send(
         self, cmd: str = "", read_after_write: bool = False
